@@ -2,11 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const Stripe = require('stripe');
-
-// ===== IMPORTANT: Replace with your Stripe secret key (if using Stripe) =====
-// If you're only using M-Pesa and card (simulated), you can leave this as is.
-const stripe = Stripe('sk_test_...'); // <-- PASTE YOUR STRIPE SECRET KEY HERE
 
 const app = express();
 const port = 5000;
@@ -22,6 +17,8 @@ let rooms = [];
 let conferenceRooms = [];
 let conferenceBookings = [];
 let payments = []; // track paid clients
+let reviews = []; // user reviews
+let subscriptions = []; // track hotel subscriptions
 let nextId = 1;
 
 // Create default admin
@@ -33,6 +30,19 @@ users.push({
     user_type: 'admin',
     full_name: 'Super Admin'
 });
+
+// ===== HELPER FUNCTIONS =====
+function isHotelVisible(hotel) {
+    if (!hotel.is_active) return false;
+    if (!hotel.subscription_expiry) return false;
+    return new Date(hotel.subscription_expiry) > new Date();
+}
+
+function isHotelFeatured(hotel) {
+    if (!hotel.is_featured) return false;
+    if (!hotel.featured_expiry) return false;
+    return new Date(hotel.featured_expiry) > new Date();
+}
 
 // ===== AUTH =====
 app.post('/api/auth/login', async (req, res) => {
@@ -98,6 +108,7 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
         totalUsers: users.filter(u => u.user_type !== 'admin').length,
         totalRooms: rooms.length,
         totalPhotos: totalPhotos,
+        totalReviews: reviews.length,
         recentHotels: hotels.slice(-5).reverse()
     });
 });
@@ -107,7 +118,9 @@ app.get('/api/admin/hotels', isAdmin, (req, res) => {
         ...h,
         owner_email: users.find(u => u.id === h.user_id)?.email || 'Unknown',
         room_count: rooms.filter(r => r.hotel_id === h.id).length,
-        photo_url: h.photos && h.photos.length > 0 ? h.photos[0] : null
+        photo_url: h.photos && h.photos.length > 0 ? h.photos[0] : null,
+        is_visible: isHotelVisible(h),
+        is_featured_active: isHotelFeatured(h)
     }));
     res.json(list);
 });
@@ -157,6 +170,9 @@ app.post('/api/admin/hotels', isAdmin, (req, res) => {
         console.log(`🆕 Created owner: ${ownerEmail}, password: ${tempPassword}`);
     }
 
+    // Set initial subscription to 30 days from now
+    const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
     const newHotel = {
         id: nextId++,
         user_id: userId,
@@ -169,6 +185,9 @@ app.post('/api/admin/hotels', isAdmin, (req, res) => {
         star_rating: starRating || 3,
         is_active: isActive !== undefined ? isActive : true,
         photos: photos || [],
+        subscription_expiry: subscriptionExpiry.toISOString(),
+        is_featured: false,
+        featured_expiry: null,
         created_at: new Date().toISOString()
     };
     hotels.push(newHotel);
@@ -207,7 +226,14 @@ app.get('/api/admin/users', isAdmin, (req, res) => {
 
 // ===== HOTEL OWNER ROUTES =====
 app.get('/api/hotels/me', isHotelOwner, (req, res) => {
-    res.json(req.hotel);
+    const hotel = req.hotel;
+    res.json({
+        ...hotel,
+        is_visible: isHotelVisible(hotel),
+        is_featured_active: isHotelFeatured(hotel),
+        subscription_days_left: hotel.subscription_expiry ? 
+            Math.max(0, Math.ceil((new Date(hotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) : 0
+    });
 });
 
 app.put('/api/hotels/me', isHotelOwner, (req, res) => {
@@ -232,6 +258,63 @@ app.post('/api/hotels/me/photos', isHotelOwner, (req, res) => {
     res.json({ message: 'Photos updated', photos: req.hotel.photos });
 });
 
+// ===== SUBSCRIPTION ROUTES =====
+app.post('/api/payments/subscribe', isHotelOwner, async (req, res) => {
+    const { amount, paymentMethod } = req.body; // amount: 1000 or 5000
+    const hotel = req.hotel;
+
+    try {
+        // In production: Verify payment via M-Pesa Daraja API or other gateway
+        // For now, we simulate success
+
+        const expiryDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        
+        if (amount === 1000) {
+            // Basic subscription - 30 days visibility
+            hotel.subscription_expiry = expiryDate.toISOString();
+            subscriptions.push({
+                id: nextId++,
+                hotel_id: hotel.id,
+                amount: 1000,
+                type: 'subscription',
+                payment_method: paymentMethod || 'mpesa',
+                created_at: new Date().toISOString(),
+                expires_at: expiryDate.toISOString()
+            });
+            res.json({ 
+                success: true, 
+                message: '✅ Subscription activated for 30 days!',
+                expiry: expiryDate.toISOString()
+            });
+        } else if (amount === 5000) {
+            // Featured subscription - 30 days visibility + featured
+            hotel.subscription_expiry = expiryDate.toISOString();
+            hotel.is_featured = true;
+            hotel.featured_expiry = expiryDate.toISOString();
+            subscriptions.push({
+                id: nextId++,
+                hotel_id: hotel.id,
+                amount: 5000,
+                type: 'featured',
+                payment_method: paymentMethod || 'mpesa',
+                created_at: new Date().toISOString(),
+                expires_at: expiryDate.toISOString()
+            });
+            res.json({ 
+                success: true, 
+                message: '✅ Featured subscription activated for 30 days!',
+                expiry: expiryDate.toISOString()
+            });
+        } else {
+            res.status(400).json({ error: 'Invalid subscription amount' });
+        }
+    } catch (error) {
+        console.error('Subscription error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ===== ROOMS =====
 app.post('/api/rooms', isHotelOwner, (req, res) => {
     const { roomTypeName, capacity, basePricePerNight, totalRooms } = req.body;
     const newRoom = {
@@ -241,7 +324,7 @@ app.post('/api/rooms', isHotelOwner, (req, res) => {
         capacity,
         base_price_per_night: basePricePerNight,
         total_rooms: totalRooms,
-        is_available: true, // by default available
+        is_available: true,
         created_at: new Date().toISOString()
     };
     rooms.push(newRoom);
@@ -253,7 +336,6 @@ app.get('/api/rooms/hotel/:hotelId', (req, res) => {
     res.json(rooms.filter(r => r.hotel_id === hotelId));
 });
 
-// Toggle room availability (new endpoint)
 app.put('/api/rooms/:id/toggle', isHotelOwner, (req, res) => {
     const id = parseInt(req.params.id);
     const room = rooms.find(r => r.id === id && r.hotel_id === req.hotel.id);
@@ -262,6 +344,27 @@ app.put('/api/rooms/:id/toggle', isHotelOwner, (req, res) => {
     res.json(room);
 });
 
+app.put('/api/rooms/:id', isHotelOwner, (req, res) => {
+    const id = parseInt(req.params.id);
+    const room = rooms.find(r => r.id === id && r.hotel_id === req.hotel.id);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    const { room_type_name, capacity, base_price_per_night, total_rooms } = req.body;
+    if (room_type_name !== undefined) room.room_type_name = room_type_name;
+    if (capacity !== undefined) room.capacity = capacity;
+    if (base_price_per_night !== undefined) room.base_price_per_night = base_price_per_night;
+    if (total_rooms !== undefined) room.total_rooms = total_rooms;
+    res.json(room);
+});
+
+app.delete('/api/rooms/:id', isHotelOwner, (req, res) => {
+    const id = parseInt(req.params.id);
+    const index = rooms.findIndex(r => r.id === id && r.hotel_id === req.hotel.id);
+    if (index === -1) return res.status(404).json({ error: 'Room not found' });
+    rooms.splice(index, 1);
+    res.json({ message: 'Deleted' });
+});
+
+// ===== CONFERENCE =====
 app.post('/api/conference', isHotelOwner, (req, res) => {
     const { roomName, capacity, pricePerHour } = req.body;
     const newConf = {
@@ -325,9 +428,10 @@ app.get('/api/conference/hotel/:hotelId/availability', (req, res) => {
 
 // ===== PUBLIC ROUTES =====
 
-// List all hotels (public) – no contact details
+// List all hotels (public) – only visible hotels
 app.get('/api/hotels/public', (req, res) => {
-    const publicHotels = hotels.map(h => ({
+    const visibleHotels = hotels.filter(h => isHotelVisible(h) && h.is_active);
+    const publicHotels = visibleHotels.map(h => ({
         id: h.id,
         hotel_name: h.hotel_name,
         city: h.city,
@@ -335,6 +439,7 @@ app.get('/api/hotels/public', (req, res) => {
         star_rating: h.star_rating,
         description: h.description,
         photos: h.photos || [],
+        is_featured: isHotelFeatured(h),
         room_types: rooms.filter(r => r.hotel_id === h.id).map(r => ({
             id: r.id,
             name: r.room_type_name,
@@ -353,11 +458,39 @@ app.get('/api/hotels/public', (req, res) => {
     res.json(publicHotels);
 });
 
-// Get single hotel details (public) – hides contacts unless paid
+// Get featured hotels
+app.get('/api/hotels/featured', (req, res) => {
+    const featuredHotels = hotels.filter(h => isHotelVisible(h) && isHotelFeatured(h) && h.is_active);
+    const result = featuredHotels.map(h => ({
+        id: h.id,
+        hotel_name: h.hotel_name,
+        city: h.city,
+        country: h.country,
+        star_rating: h.star_rating,
+        description: h.description,
+        photos: h.photos || [],
+        room_types: rooms.filter(r => r.hotel_id === h.id).map(r => ({
+            id: r.id,
+            name: r.room_type_name,
+            capacity: r.capacity,
+            price_per_night: r.base_price_per_night,
+            total_rooms: r.total_rooms,
+            is_available: r.is_available !== false
+        }))
+    }));
+    res.json(result);
+});
+
+// Get single hotel details – hides contacts unless paid
 app.get('/api/hotels/:id', async (req, res) => {
     const id = parseInt(req.params.id);
     const hotel = hotels.find(h => h.id === id);
     if (!hotel) return res.status(404).json({ error: 'Hotel not found' });
+
+    // Check if hotel is visible
+    if (!isHotelVisible(hotel) || !hotel.is_active) {
+        return res.status(403).json({ error: 'Hotel is currently unavailable' });
+    }
 
     let hasAccess = false;
     const token = req.headers.authorization?.split(' ')[1];
@@ -375,6 +508,11 @@ app.get('/api/hotels/:id', async (req, res) => {
         } catch (e) { /* ignore */ }
     }
 
+    // Get reviews for this hotel
+    const hotelReviews = reviews.filter(r => r.hotel_id === id).sort((a, b) => 
+        new Date(b.created_at) - new Date(a.created_at)
+    );
+
     const response = {
         id: hotel.id,
         hotel_name: hotel.hotel_name,
@@ -386,6 +524,7 @@ app.get('/api/hotels/:id', async (req, res) => {
         star_rating: hotel.star_rating,
         description: hotel.description,
         photos: hotel.photos || [],
+        is_featured: isHotelFeatured(hotel),
         room_types: rooms.filter(r => r.hotel_id === hotel.id).map(r => ({
             id: r.id,
             name: r.room_type_name,
@@ -400,97 +539,54 @@ app.get('/api/hotels/:id', async (req, res) => {
             capacity: c.capacity,
             price_per_hour: hasAccess ? c.price_per_hour : null
         })),
+        reviews: hotelReviews.map(r => ({
+            id: r.id,
+            user_name: r.user_name,
+            rating: r.rating,
+            comment: r.comment,
+            created_at: r.created_at
+        })),
         hasAccess: hasAccess,
-        unlockPrice: 4.99
+        unlockPrice: 100 // KES
     };
     res.json(response);
 });
 
-// ===== PAYMENT ROUTES =====
-
-// Stripe Checkout (keep if you want)
-app.post('/api/payments/create-checkout-session', async (req, res) => {
-    const { hotelId } = req.body;
+// ===== REVIEWS =====
+app.post('/api/reviews', async (req, res) => {
+    const { hotel_id, rating, comment } = req.body;
     const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Please login first' });
+    if (!token) return res.status(401).json({ error: 'Please login to post a review' });
 
     try {
         const decoded = jwt.verify(token, 'secret');
-        const clientId = decoded.id;
+        const userId = decoded.id;
+        const user = users.find(u => u.id === userId);
+        if (!user) return res.status(404).json({ error: 'User not found' });
 
-        const hotel = hotels.find(h => h.id === parseInt(hotelId));
+        const hotel = hotels.find(h => h.id === parseInt(hotel_id));
         if (!hotel) return res.status(404).json({ error: 'Hotel not found' });
 
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
-            line_items: [{
-                price_data: {
-                    currency: 'usd',
-                    product_data: {
-                        name: `Unlock ${hotel.hotel_name} details`,
-                        description: `Access phone, email and exact address for ${hotel.hotel_name}`,
-                    },
-                    unit_amount: 499,
-                },
-                quantity: 1,
-            }],
-            mode: 'payment',
-            success_url: `${req.headers.origin}/hotel-detail.html?id=${hotelId}&session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${req.headers.origin}/hotel-detail.html?id=${hotelId}`,
-            metadata: {
-                client_id: clientId.toString(),
-                hotel_id: hotelId.toString()
-            }
-        });
-
-        res.json({ sessionId: session.id, url: session.url });
+        const newReview = {
+            id: nextId++,
+            hotel_id: parseInt(hotel_id),
+            user_id: userId,
+            user_name: user.full_name || user.email,
+            rating: Math.min(5, Math.max(1, parseInt(rating))),
+            comment: comment || '',
+            created_at: new Date().toISOString()
+        };
+        reviews.push(newReview);
+        res.status(201).json(newReview);
     } catch (error) {
-        console.error('Stripe error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Confirm Stripe payment
-app.post('/api/payments/confirm', async (req, res) => {
-    const { session_id, hotel_id } = req.body;
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Not logged in' });
+// ===== PAYMENT ROUTES =====
+const UNLOCK_PRICE_KES = 100;
 
-    try {
-        const decoded = jwt.verify(token, 'secret');
-        const clientId = decoded.id;
-
-        const session = await stripe.checkout.sessions.retrieve(session_id);
-        if (session.payment_status !== 'paid') {
-            return res.status(400).json({ error: 'Payment not completed' });
-        }
-
-        let payment = payments.find(p => 
-            p.client_id === clientId && 
-            p.hotel_id === parseInt(hotel_id)
-        );
-
-        if (payment) {
-            payment.paid = true;
-            payment.expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-        } else {
-            payments.push({
-                client_id: clientId,
-                hotel_id: parseInt(hotel_id),
-                paid: true,
-                session_id: session_id,
-                expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
-            });
-        }
-
-        res.json({ success: true, message: 'Access granted' });
-    } catch (error) {
-        console.error('Confirm error:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// ===== M-PESA PAYMENT (Simulated) =====
+// M-PESA Payment for client unlock
 app.post('/api/payments/mpesa/confirm', async (req, res) => {
     const { hotel_id, phone_number, till_number, amount } = req.body;
     const token = req.headers.authorization?.split(' ')[1];
@@ -517,7 +613,8 @@ app.post('/api/payments/mpesa/confirm', async (req, res) => {
                 hotel_id: parseInt(hotel_id),
                 paid: true,
                 session_id: 'mpesa_' + Date.now(),
-                expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+                expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+                amount: UNLOCK_PRICE_KES
             });
         }
 
@@ -528,7 +625,7 @@ app.post('/api/payments/mpesa/confirm', async (req, res) => {
     }
 });
 
-// ===== CARD PAYMENT (Simulated) =====
+// Card Payment for client unlock
 app.post('/api/payments/card/confirm', async (req, res) => {
     const { hotel_id, card_last4, amount } = req.body;
     const token = req.headers.authorization?.split(' ')[1];
@@ -537,9 +634,6 @@ app.post('/api/payments/card/confirm', async (req, res) => {
     try {
         const decoded = jwt.verify(token, 'secret');
         const clientId = decoded.id;
-
-        // In production: Verify card payment via payment gateway
-        // For now, we simulate success
 
         let payment = payments.find(p => 
             p.client_id === clientId && 
@@ -555,7 +649,8 @@ app.post('/api/payments/card/confirm', async (req, res) => {
                 hotel_id: parseInt(hotel_id),
                 paid: true,
                 session_id: 'card_' + Date.now(),
-                expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+                expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+                amount: UNLOCK_PRICE_KES
             });
         }
 
@@ -591,4 +686,5 @@ app.get('/api/hotels/:id/access', async (req, res) => {
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`👤 Admin: admin@hotelbooking.com / admin123`);
+    console.log(`💰 Client unlock price: ${UNLOCK_PRICE_KES} KES`);
 });
