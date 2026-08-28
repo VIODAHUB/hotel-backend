@@ -4,8 +4,9 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const Stripe = require('stripe');
 
-// ===== IMPORTANT: Replace with your Stripe secret key =====
-const stripe = Stripe('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'); // <-- PASTE YOUR SECRET KEY HERE
+// ===== IMPORTANT: Replace with your Stripe secret key (if using Stripe) =====
+// If you're only using M-Pesa and card (simulated), you can leave this as is.
+const stripe = Stripe('sk_test_...'); // <-- PASTE YOUR STRIPE SECRET KEY HERE
 
 const app = express();
 const port = 5000;
@@ -240,6 +241,7 @@ app.post('/api/rooms', isHotelOwner, (req, res) => {
         capacity,
         base_price_per_night: basePricePerNight,
         total_rooms: totalRooms,
+        is_available: true, // by default available
         created_at: new Date().toISOString()
     };
     rooms.push(newRoom);
@@ -249,6 +251,15 @@ app.post('/api/rooms', isHotelOwner, (req, res) => {
 app.get('/api/rooms/hotel/:hotelId', (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     res.json(rooms.filter(r => r.hotel_id === hotelId));
+});
+
+// Toggle room availability (new endpoint)
+app.put('/api/rooms/:id/toggle', isHotelOwner, (req, res) => {
+    const id = parseInt(req.params.id);
+    const room = rooms.find(r => r.id === id && r.hotel_id === req.hotel.id);
+    if (!room) return res.status(404).json({ error: 'Room not found' });
+    room.is_available = req.body.is_available !== undefined ? req.body.is_available : true;
+    res.json(room);
 });
 
 app.post('/api/conference', isHotelOwner, (req, res) => {
@@ -329,7 +340,8 @@ app.get('/api/hotels/public', (req, res) => {
             name: r.room_type_name,
             capacity: r.capacity,
             price_per_night: r.base_price_per_night,
-            total_rooms: r.total_rooms
+            total_rooms: r.total_rooms,
+            is_available: r.is_available !== false
         })),
         conference_rooms: conferenceRooms.filter(c => c.hotel_id === h.id).map(c => ({
             id: c.id,
@@ -379,7 +391,8 @@ app.get('/api/hotels/:id', async (req, res) => {
             name: r.room_type_name,
             capacity: r.capacity,
             price_per_night: hasAccess ? r.base_price_per_night : null,
-            total_rooms: r.total_rooms
+            total_rooms: r.total_rooms,
+            is_available: r.is_available !== false
         })),
         conference_rooms: conferenceRooms.filter(c => c.hotel_id === hotel.id).map(c => ({
             id: c.id,
@@ -395,7 +408,7 @@ app.get('/api/hotels/:id', async (req, res) => {
 
 // ===== PAYMENT ROUTES =====
 
-// Create Stripe Checkout session
+// Stripe Checkout (keep if you want)
 app.post('/api/payments/create-checkout-session', async (req, res) => {
     const { hotelId } = req.body;
     const token = req.headers.authorization?.split(' ')[1];
@@ -437,7 +450,7 @@ app.post('/api/payments/create-checkout-session', async (req, res) => {
     }
 });
 
-// Confirm payment (called from frontend after redirect)
+// Confirm Stripe payment
 app.post('/api/payments/confirm', async (req, res) => {
     const { session_id, hotel_id } = req.body;
     const token = req.headers.authorization?.split(' ')[1];
@@ -473,6 +486,82 @@ app.post('/api/payments/confirm', async (req, res) => {
         res.json({ success: true, message: 'Access granted' });
     } catch (error) {
         console.error('Confirm error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ===== M-PESA PAYMENT (Simulated) =====
+app.post('/api/payments/mpesa/confirm', async (req, res) => {
+    const { hotel_id, phone_number, till_number, amount } = req.body;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Not logged in' });
+
+    try {
+        const decoded = jwt.verify(token, 'secret');
+        const clientId = decoded.id;
+
+        // In production: Verify M-Pesa payment via Safaricom Daraja API
+        // For now, we simulate success
+
+        let payment = payments.find(p => 
+            p.client_id === clientId && 
+            p.hotel_id === parseInt(hotel_id)
+        );
+
+        if (payment) {
+            payment.paid = true;
+            payment.expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        } else {
+            payments.push({
+                client_id: clientId,
+                hotel_id: parseInt(hotel_id),
+                paid: true,
+                session_id: 'mpesa_' + Date.now(),
+                expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+            });
+        }
+
+        res.json({ success: true, message: 'M-Pesa payment confirmed' });
+    } catch (error) {
+        console.error('M-Pesa confirm error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ===== CARD PAYMENT (Simulated) =====
+app.post('/api/payments/card/confirm', async (req, res) => {
+    const { hotel_id, card_last4, amount } = req.body;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Not logged in' });
+
+    try {
+        const decoded = jwt.verify(token, 'secret');
+        const clientId = decoded.id;
+
+        // In production: Verify card payment via payment gateway
+        // For now, we simulate success
+
+        let payment = payments.find(p => 
+            p.client_id === clientId && 
+            p.hotel_id === parseInt(hotel_id)
+        );
+
+        if (payment) {
+            payment.paid = true;
+            payment.expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        } else {
+            payments.push({
+                client_id: clientId,
+                hotel_id: parseInt(hotel_id),
+                paid: true,
+                session_id: 'card_' + Date.now(),
+                expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+            });
+        }
+
+        res.json({ success: true, message: 'Card payment confirmed' });
+    } catch (error) {
+        console.error('Card confirm error:', error);
         res.status(500).json({ error: error.message });
     }
 });
