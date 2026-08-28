@@ -5,7 +5,7 @@ const bcrypt = require('bcryptjs');
 const Stripe = require('stripe');
 
 // ===== IMPORTANT: Replace with your Stripe secret key =====
-const stripe = Stripe('sk_test_...'); // <-- PASTE YOUR SECRET KEY HERE
+const stripe = Stripe('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'); // <-- PASTE YOUR SECRET KEY HERE
 
 const app = express();
 const port = 5000;
