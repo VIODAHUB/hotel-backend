@@ -2,11 +2,14 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const Stripe = require('stripe');
+
+// ===== IMPORTANT: Replace with your Stripe secret key =====
+const stripe = Stripe('sk_test_...'); // <-- PASTE YOUR SECRET KEY HERE
 
 const app = express();
 const port = 5000;
 
-// Increase payload size for photos
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(cors({ origin: '*' }));
@@ -17,6 +20,7 @@ let hotels = [];
 let rooms = [];
 let conferenceRooms = [];
 let conferenceBookings = [];
+let payments = []; // track paid clients
 let nextId = 1;
 
 // Create default admin
@@ -40,7 +44,6 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({ token, user: { id: user.id, email: user.email, userType: user.user_type, full_name: user.full_name } });
 });
 
-// Register (public)
 app.post('/api/auth/register', async (req, res) => {
     const { email, password, userType, companyName, fullName } = req.body;
     if (users.find(u => u.email === email)) {
@@ -87,8 +90,6 @@ const isHotelOwner = (req, res, next) => {
 };
 
 // ===== ADMIN ROUTES =====
-
-// Dashboard stats
 app.get('/api/admin/stats', isAdmin, (req, res) => {
     const totalPhotos = hotels.reduce((acc, h) => acc + (h.photos ? h.photos.length : 0), 0);
     res.json({
@@ -100,7 +101,6 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
     });
 });
 
-// Get all hotels
 app.get('/api/admin/hotels', isAdmin, (req, res) => {
     const list = hotels.map(h => ({
         ...h,
@@ -111,7 +111,6 @@ app.get('/api/admin/hotels', isAdmin, (req, res) => {
     res.json(list);
 });
 
-// Get single hotel
 app.get('/api/admin/hotels/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     const hotel = hotels.find(h => h.id === id);
@@ -119,7 +118,6 @@ app.get('/api/admin/hotels/:id', isAdmin, (req, res) => {
     res.json(hotel);
 });
 
-// ✅ CREATE HOTEL (with photos)
 app.post('/api/admin/hotels', isAdmin, (req, res) => {
     const { 
         hotelName, 
@@ -138,7 +136,6 @@ app.post('/api/admin/hotels', isAdmin, (req, res) => {
         return res.status(400).json({ error: 'Maximum 5 photos allowed' });
     }
 
-    // Find or create owner
     let owner = users.find(u => u.email === ownerEmail && u.user_type === 'hotel');
     let userId;
     if (owner) {
@@ -177,7 +174,6 @@ app.post('/api/admin/hotels', isAdmin, (req, res) => {
     res.status(201).json(newHotel);
 });
 
-// Update hotel
 app.put('/api/admin/hotels/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     const hotel = hotels.find(h => h.id === id);
@@ -194,7 +190,6 @@ app.put('/api/admin/hotels/:id', isAdmin, (req, res) => {
     res.json(hotel);
 });
 
-// Delete hotel
 app.delete('/api/admin/hotels/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     const index = hotels.findIndex(h => h.id === id);
@@ -205,19 +200,15 @@ app.delete('/api/admin/hotels/:id', isAdmin, (req, res) => {
     res.json({ message: 'Deleted' });
 });
 
-// Get all users
 app.get('/api/admin/users', isAdmin, (req, res) => {
     res.json(users.map(u => ({ id: u.id, email: u.email, user_type: u.user_type, full_name: u.full_name })));
 });
 
 // ===== HOTEL OWNER ROUTES =====
-
-// Get owner's hotel
 app.get('/api/hotels/me', isHotelOwner, (req, res) => {
     res.json(req.hotel);
 });
 
-// Update owner's hotel
 app.put('/api/hotels/me', isHotelOwner, (req, res) => {
     const { hotelName, phone, city, country, address, description, starRating } = req.body;
     const hotel = req.hotel;
@@ -231,7 +222,6 @@ app.put('/api/hotels/me', isHotelOwner, (req, res) => {
     res.json(hotel);
 });
 
-// Upload photos
 app.post('/api/hotels/me/photos', isHotelOwner, (req, res) => {
     const { photos } = req.body;
     if (photos && photos.length > 5) {
@@ -241,7 +231,6 @@ app.post('/api/hotels/me/photos', isHotelOwner, (req, res) => {
     res.json({ message: 'Photos updated', photos: req.hotel.photos });
 });
 
-// Add room type
 app.post('/api/rooms', isHotelOwner, (req, res) => {
     const { roomTypeName, capacity, basePricePerNight, totalRooms } = req.body;
     const newRoom = {
@@ -257,13 +246,11 @@ app.post('/api/rooms', isHotelOwner, (req, res) => {
     res.status(201).json(newRoom);
 });
 
-// Get rooms
 app.get('/api/rooms/hotel/:hotelId', (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     res.json(rooms.filter(r => r.hotel_id === hotelId));
 });
 
-// Add conference room
 app.post('/api/conference', isHotelOwner, (req, res) => {
     const { roomName, capacity, pricePerHour } = req.body;
     const newConf = {
@@ -279,13 +266,11 @@ app.post('/api/conference', isHotelOwner, (req, res) => {
     res.status(201).json(newConf);
 });
 
-// Get conference rooms
 app.get('/api/conference/hotel/:hotelId', (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     res.json(conferenceRooms.filter(c => c.hotel_id === hotelId));
 });
 
-// Book conference room
 app.post('/api/conference/bookings', isHotelOwner, (req, res) => {
     const { conferenceRoomId, bookingDate, startTime, endTime, purpose } = req.body;
     const confRoom = conferenceRooms.find(c => c.id === conferenceRoomId && c.hotel_id === req.hotel.id);
@@ -315,7 +300,6 @@ app.post('/api/conference/bookings', isHotelOwner, (req, res) => {
     res.status(201).json(newBooking);
 });
 
-// Get availability
 app.get('/api/conference/hotel/:hotelId/availability', (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     const confs = conferenceRooms.filter(c => c.hotel_id === hotelId);
@@ -326,6 +310,192 @@ app.get('/api/conference/hotel/:hotelId/availability', (req, res) => {
             .map(b => ({ date: b.booking_date, start: b.start_time, end: b.end_time }))
     }));
     res.json(result);
+});
+
+// ===== PUBLIC ROUTES =====
+
+// List all hotels (public) – no contact details
+app.get('/api/hotels/public', (req, res) => {
+    const publicHotels = hotels.map(h => ({
+        id: h.id,
+        hotel_name: h.hotel_name,
+        city: h.city,
+        country: h.country,
+        star_rating: h.star_rating,
+        description: h.description,
+        photos: h.photos || [],
+        room_types: rooms.filter(r => r.hotel_id === h.id).map(r => ({
+            id: r.id,
+            name: r.room_type_name,
+            capacity: r.capacity,
+            price_per_night: r.base_price_per_night,
+            total_rooms: r.total_rooms
+        })),
+        conference_rooms: conferenceRooms.filter(c => c.hotel_id === h.id).map(c => ({
+            id: c.id,
+            name: c.room_name,
+            capacity: c.capacity,
+            price_per_hour: c.price_per_hour
+        }))
+    }));
+    res.json(publicHotels);
+});
+
+// Get single hotel details (public) – hides contacts unless paid
+app.get('/api/hotels/:id', async (req, res) => {
+    const id = parseInt(req.params.id);
+    const hotel = hotels.find(h => h.id === id);
+    if (!hotel) return res.status(404).json({ error: 'Hotel not found' });
+
+    let hasAccess = false;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) {
+        try {
+            const decoded = jwt.verify(token, 'secret');
+            const clientId = decoded.id;
+            const payment = payments.find(p => 
+                p.client_id === clientId && 
+                p.hotel_id === id && 
+                p.paid === true &&
+                new Date(p.expires_at) > new Date()
+            );
+            if (payment) hasAccess = true;
+        } catch (e) { /* ignore */ }
+    }
+
+    const response = {
+        id: hotel.id,
+        hotel_name: hotel.hotel_name,
+        city: hotel.city,
+        country: hotel.country,
+        address: hasAccess ? hotel.address : null,
+        phone: hasAccess ? hotel.phone : null,
+        email: hasAccess ? users.find(u => u.id === hotel.user_id)?.email : null,
+        star_rating: hotel.star_rating,
+        description: hotel.description,
+        photos: hotel.photos || [],
+        room_types: rooms.filter(r => r.hotel_id === hotel.id).map(r => ({
+            id: r.id,
+            name: r.room_type_name,
+            capacity: r.capacity,
+            price_per_night: hasAccess ? r.base_price_per_night : null,
+            total_rooms: r.total_rooms
+        })),
+        conference_rooms: conferenceRooms.filter(c => c.hotel_id === hotel.id).map(c => ({
+            id: c.id,
+            name: c.room_name,
+            capacity: c.capacity,
+            price_per_hour: hasAccess ? c.price_per_hour : null
+        })),
+        hasAccess: hasAccess,
+        unlockPrice: 4.99
+    };
+    res.json(response);
+});
+
+// ===== PAYMENT ROUTES =====
+
+// Create Stripe Checkout session
+app.post('/api/payments/create-checkout-session', async (req, res) => {
+    const { hotelId } = req.body;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Please login first' });
+
+    try {
+        const decoded = jwt.verify(token, 'secret');
+        const clientId = decoded.id;
+
+        const hotel = hotels.find(h => h.id === parseInt(hotelId));
+        if (!hotel) return res.status(404).json({ error: 'Hotel not found' });
+
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            line_items: [{
+                price_data: {
+                    currency: 'usd',
+                    product_data: {
+                        name: `Unlock ${hotel.hotel_name} details`,
+                        description: `Access phone, email and exact address for ${hotel.hotel_name}`,
+                    },
+                    unit_amount: 499,
+                },
+                quantity: 1,
+            }],
+            mode: 'payment',
+            success_url: `${req.headers.origin}/hotel-detail.html?id=${hotelId}&session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${req.headers.origin}/hotel-detail.html?id=${hotelId}`,
+            metadata: {
+                client_id: clientId.toString(),
+                hotel_id: hotelId.toString()
+            }
+        });
+
+        res.json({ sessionId: session.id, url: session.url });
+    } catch (error) {
+        console.error('Stripe error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Confirm payment (called from frontend after redirect)
+app.post('/api/payments/confirm', async (req, res) => {
+    const { session_id, hotel_id } = req.body;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Not logged in' });
+
+    try {
+        const decoded = jwt.verify(token, 'secret');
+        const clientId = decoded.id;
+
+        const session = await stripe.checkout.sessions.retrieve(session_id);
+        if (session.payment_status !== 'paid') {
+            return res.status(400).json({ error: 'Payment not completed' });
+        }
+
+        let payment = payments.find(p => 
+            p.client_id === clientId && 
+            p.hotel_id === parseInt(hotel_id)
+        );
+
+        if (payment) {
+            payment.paid = true;
+            payment.expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        } else {
+            payments.push({
+                client_id: clientId,
+                hotel_id: parseInt(hotel_id),
+                paid: true,
+                session_id: session_id,
+                expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+            });
+        }
+
+        res.json({ success: true, message: 'Access granted' });
+    } catch (error) {
+        console.error('Confirm error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Check access for a hotel
+app.get('/api/hotels/:id/access', async (req, res) => {
+    const hotelId = parseInt(req.params.id);
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.json({ hasAccess: false });
+
+    try {
+        const decoded = jwt.verify(token, 'secret');
+        const clientId = decoded.id;
+        const payment = payments.find(p =>
+            p.client_id === clientId &&
+            p.hotel_id === hotelId &&
+            p.paid === true &&
+            new Date(p.expires_at) > new Date()
+        );
+        res.json({ hasAccess: !!payment });
+    } catch (e) {
+        res.json({ hasAccess: false });
+    }
 });
 
 // ===== START SERVER =====
