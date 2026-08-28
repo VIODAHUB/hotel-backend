@@ -6,14 +6,16 @@ const bcrypt = require('bcryptjs');
 const app = express();
 const port = 5000;
 
-// Increase payload size limit to allow large photo data
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(cors({ origin: '*' }));
 
-// Fake database (in memory)
+// ===== In-memory data =====
 let users = [];
 let hotels = [];
+let rooms = [];
+let conferenceRooms = [];
+let conferenceBookings = [];
 let nextId = 1;
 
 // Create default admin
@@ -37,7 +39,7 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({ token, user: { id: user.id, email: user.email, userType: user.user_type, full_name: user.full_name } });
 });
 
-// ===== ADMIN ROUTES =====
+// ===== Middleware =====
 const isAdmin = (req, res, next) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'No token' });
@@ -49,99 +51,147 @@ const isAdmin = (req, res, next) => {
     } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
 
-app.get('/api/admin/stats', isAdmin, (req, res) => {
-    res.json({
-        totalHotels: hotels.length,
-        totalUsers: users.filter(u => u.user_type !== 'admin').length,
-        totalRooms: 0,
-        totalPhotos: hotels.reduce((acc, h) => acc + (h.photos ? h.photos.length : 0), 0),
-        recentHotels: hotels.slice(-5).reverse()
-    });
+const isHotelOwner = (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'No token' });
+    try {
+        const decoded = jwt.verify(token, 'secret');
+        if (decoded.userType !== 'hotel') return res.status(403).json({ error: 'Hotel owner only' });
+        req.userId = decoded.id;
+        // Find the hotel owned by this user
+        const hotel = hotels.find(h => h.user_id === decoded.id);
+        if (!hotel) return res.status(404).json({ error: 'No hotel found for this owner' });
+        req.hotel = hotel;
+        next();
+    } catch { res.status(401).json({ error: 'Invalid token' }); }
+};
+
+// ===== ADMIN ROUTES (existing) =====
+// ... (keep all your admin routes from before) ...
+
+// ===== HOTEL OWNER ROUTES =====
+
+// Get owner's hotel
+app.get('/api/hotels/me', isHotelOwner, (req, res) => {
+    res.json(req.hotel);
 });
 
-app.get('/api/admin/hotels', isAdmin, (req, res) => {
-    const list = hotels.map(h => ({
-        ...h,
-        owner_email: 'owner@example.com',
-        room_count: 0,
-        photo_url: h.photos && h.photos.length > 0 ? h.photos[0] : null
-    }));
-    res.json(list);
-});
-
-// ✅ UPDATED: POST /admin/hotels now accepts phone and photos
-app.post('/api/admin/hotels', isAdmin, (req, res) => {
-    const { 
-        hotelName, 
-        ownerEmail, 
-        city, 
-        country, 
-        address,
-        description, 
-        starRating, 
-        isActive,
-        phone,
-        photos   // array of base64 strings (max 5)
-    } = req.body;
-
-    // Validate photo count
-    if (photos && photos.length > 5) {
-        return res.status(400).json({ error: 'Maximum 5 photos allowed' });
-    }
-
-    const newHotel = {
-        id: nextId++,
-        hotel_name: hotelName,
-        city,
-        country,
-        address,
-        description,
-        star_rating: starRating || 3,
-        is_active: isActive !== undefined ? isActive : true,
-        phone: phone || '',
-        photos: photos || [],
-        created_at: new Date().toISOString()
-    };
-    hotels.push(newHotel);
-    res.status(201).json(newHotel);
-});
-
-// ✅ UPDATED: GET single hotel returns all data including photos
-app.get('/api/admin/hotels/:id', isAdmin, (req, res) => {
-    const id = parseInt(req.params.id);
-    const hotel = hotels.find(h => h.id === id);
-    if (!hotel) return res.status(404).json({ error: 'Not found' });
-    res.json(hotel);
-});
-
-app.put('/api/admin/hotels/:id', isAdmin, (req, res) => {
-    const id = parseInt(req.params.id);
-    const hotel = hotels.find(h => h.id === id);
-    if (!hotel) return res.status(404).json({ error: 'Not found' });
-    // Update allowed fields
-    const { hotelName, city, country, address, description, starRating, isActive, phone, photos } = req.body;
+// Update owner's hotel
+app.put('/api/hotels/me', isHotelOwner, async (req, res) => {
+    const { hotelName, phone, city, country, address, description, starRating, isActive } = req.body;
+    const hotel = req.hotel;
     if (hotelName !== undefined) hotel.hotel_name = hotelName;
+    if (phone !== undefined) hotel.phone = phone;
     if (city !== undefined) hotel.city = city;
     if (country !== undefined) hotel.country = country;
     if (address !== undefined) hotel.address = address;
     if (description !== undefined) hotel.description = description;
     if (starRating !== undefined) hotel.star_rating = starRating;
     if (isActive !== undefined) hotel.is_active = isActive;
-    if (phone !== undefined) hotel.phone = phone;
-    if (photos !== undefined) hotel.photos = photos;
     res.json(hotel);
 });
 
-app.delete('/api/admin/hotels/:id', isAdmin, (req, res) => {
-    const id = parseInt(req.params.id);
-    const index = hotels.findIndex(h => h.id === id);
-    if (index === -1) return res.status(404).json({ error: 'Not found' });
-    hotels.splice(index, 1);
-    res.json({ message: 'Deleted' });
+// Upload photos (replace all)
+app.post('/api/hotels/me/photos', isHotelOwner, (req, res) => {
+    const { photos } = req.body; // array of base64 strings (max 5)
+    if (photos && photos.length > 5) {
+        return res.status(400).json({ error: 'Maximum 5 photos allowed' });
+    }
+    req.hotel.photos = photos || [];
+    res.json({ message: 'Photos updated', photos: req.hotel.photos });
 });
 
-app.get('/api/admin/users', isAdmin, (req, res) => {
-    res.json(users.map(u => ({ id: u.id, email: u.email, user_type: u.user_type, full_name: u.full_name })));
+// Add room type
+app.post('/api/rooms', isHotelOwner, (req, res) => {
+    const { roomTypeName, capacity, basePricePerNight, totalRooms } = req.body;
+    const newRoom = {
+        id: nextId++,
+        hotel_id: req.hotel.id,
+        room_type_name: roomTypeName,
+        capacity,
+        base_price_per_night: basePricePerNight,
+        total_rooms: totalRooms,
+        created_at: new Date().toISOString()
+    };
+    rooms.push(newRoom);
+    res.status(201).json(newRoom);
 });
 
+// Get rooms for a hotel (public, but we check if it's the owner's hotel)
+app.get('/api/rooms/hotel/:hotelId', (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    const hotelRooms = rooms.filter(r => r.hotel_id === hotelId);
+    res.json(hotelRooms);
+});
+
+// Add conference room
+app.post('/api/conference', isHotelOwner, (req, res) => {
+    const { roomName, capacity, pricePerHour } = req.body;
+    const newConf = {
+        id: nextId++,
+        hotel_id: req.hotel.id,
+        room_name: roomName,
+        capacity,
+        price_per_hour: pricePerHour,
+        is_available: true,
+        created_at: new Date().toISOString()
+    };
+    conferenceRooms.push(newConf);
+    res.status(201).json(newConf);
+});
+
+// Get conference rooms for a hotel
+app.get('/api/conference/hotel/:hotelId', (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    const confs = conferenceRooms.filter(c => c.hotel_id === hotelId);
+    res.json(confs);
+});
+
+// Book a conference room
+app.post('/api/conference/bookings', isHotelOwner, (req, res) => {
+    const { conferenceRoomId, bookingDate, startTime, endTime, purpose } = req.body;
+    // Check if the conference room belongs to this hotel
+    const confRoom = conferenceRooms.find(c => c.id === conferenceRoomId && c.hotel_id === req.hotel.id);
+    if (!confRoom) return res.status(404).json({ error: 'Conference room not found' });
+    // Check for double booking (simple check)
+    const conflict = conferenceBookings.find(b =>
+        b.conference_room_id === conferenceRoomId &&
+        b.booking_date === bookingDate &&
+        ((startTime >= b.start_time && startTime < b.end_time) ||
+         (endTime > b.start_time && endTime <= b.end_time))
+    );
+    if (conflict) return res.status(400).json({ error: 'Time slot already booked' });
+    const newBooking = {
+        id: nextId++,
+        conference_room_id: conferenceRoomId,
+        booked_by: req.userId,
+        booking_date: bookingDate,
+        start_time: startTime,
+        end_time: endTime,
+        purpose: purpose || '',
+        status: 'confirmed',
+        created_at: new Date().toISOString()
+    };
+    conferenceBookings.push(newBooking);
+    res.status(201).json(newBooking);
+});
+
+// Get availability for a conference room
+app.get('/api/conference/hotel/:hotelId/availability', (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    const confs = conferenceRooms.filter(c => c.hotel_id === hotelId);
+    const result = confs.map(c => {
+        const bookings = conferenceBookings.filter(b => b.conference_room_id === c.id && b.status === 'confirmed');
+        return {
+            ...c,
+            bookings: bookings.map(b => ({ date: b.booking_date, start: b.start_time, end: b.end_time }))
+        };
+    });
+    res.json(result);
+});
+
+// ===== REGULAR HOTEL OWNER REGISTRATION (already exists) =====
+// We also need a public registration endpoint – we already have one.
+
+// ===== START SERVER =====
 app.listen(port, '0.0.0.0', () => console.log(`Server running on port ${port}`));
