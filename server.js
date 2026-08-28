@@ -6,8 +6,10 @@ const bcrypt = require('bcryptjs');
 const app = express();
 const port = 5000;
 
+// Increase payload size limit to allow large photo data
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(cors({ origin: '*' }));
-app.use(express.json());
 
 // Fake database (in memory)
 let users = [];
@@ -52,37 +54,81 @@ app.get('/api/admin/stats', isAdmin, (req, res) => {
         totalHotels: hotels.length,
         totalUsers: users.filter(u => u.user_type !== 'admin').length,
         totalRooms: 0,
-        totalPhotos: 0,
+        totalPhotos: hotels.reduce((acc, h) => acc + (h.photos ? h.photos.length : 0), 0),
         recentHotels: hotels.slice(-5).reverse()
     });
 });
 
 app.get('/api/admin/hotels', isAdmin, (req, res) => {
-    const list = hotels.map(h => ({ ...h, owner_email: 'owner@example.com', room_count: 0, photo_url: null }));
+    const list = hotels.map(h => ({
+        ...h,
+        owner_email: 'owner@example.com',
+        room_count: 0,
+        photo_url: h.photos && h.photos.length > 0 ? h.photos[0] : null
+    }));
     res.json(list);
 });
 
+// ✅ UPDATED: POST /admin/hotels now accepts phone and photos
 app.post('/api/admin/hotels', isAdmin, (req, res) => {
-    const { hotelName, ownerEmail, city, country, description, starRating, isActive } = req.body;
+    const { 
+        hotelName, 
+        ownerEmail, 
+        city, 
+        country, 
+        address,
+        description, 
+        starRating, 
+        isActive,
+        phone,
+        photos   // array of base64 strings (max 5)
+    } = req.body;
+
+    // Validate photo count
+    if (photos && photos.length > 5) {
+        return res.status(400).json({ error: 'Maximum 5 photos allowed' });
+    }
+
     const newHotel = {
         id: nextId++,
         hotel_name: hotelName,
         city,
         country,
+        address,
         description,
         star_rating: starRating || 3,
         is_active: isActive !== undefined ? isActive : true,
+        phone: phone || '',
+        photos: photos || [],
         created_at: new Date().toISOString()
     };
     hotels.push(newHotel);
     res.status(201).json(newHotel);
 });
 
+// ✅ UPDATED: GET single hotel returns all data including photos
+app.get('/api/admin/hotels/:id', isAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const hotel = hotels.find(h => h.id === id);
+    if (!hotel) return res.status(404).json({ error: 'Not found' });
+    res.json(hotel);
+});
+
 app.put('/api/admin/hotels/:id', isAdmin, (req, res) => {
     const id = parseInt(req.params.id);
     const hotel = hotels.find(h => h.id === id);
     if (!hotel) return res.status(404).json({ error: 'Not found' });
-    Object.assign(hotel, req.body);
+    // Update allowed fields
+    const { hotelName, city, country, address, description, starRating, isActive, phone, photos } = req.body;
+    if (hotelName !== undefined) hotel.hotel_name = hotelName;
+    if (city !== undefined) hotel.city = city;
+    if (country !== undefined) hotel.country = country;
+    if (address !== undefined) hotel.address = address;
+    if (description !== undefined) hotel.description = description;
+    if (starRating !== undefined) hotel.star_rating = starRating;
+    if (isActive !== undefined) hotel.is_active = isActive;
+    if (phone !== undefined) hotel.phone = phone;
+    if (photos !== undefined) hotel.photos = photos;
     res.json(hotel);
 });
 
