@@ -14,9 +14,7 @@ app.use(cors({ origin: '*' }));
 // ===== DATABASE CONNECTION =====
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: {
-        rejectUnauthorized: false   // Disables SSL certificate verification
-    }
+    ssl: { rejectUnauthorized: false }
 });
 
 // Test connection
@@ -25,39 +23,46 @@ pool.connect((err) => {
     else console.log('✅ Connected to PostgreSQL');
 });
 
-// ===== HELPERS =====
-const isHotelVisible = async (hotelId) => {
-    const result = await pool.query(
-        `SELECT is_active, subscription_expiry FROM hotels WHERE id = $1`,
-        [hotelId]
-    );
-    if (result.rows.length === 0) return false;
-    const hotel = result.rows[0];
-    if (!hotel.is_active) return false;
-    if (!hotel.subscription_expiry) return false;
-    return new Date(hotel.subscription_expiry) > new Date();
-};
+// ===== ENSURE ADMIN USER EXISTS WITH CORRECT PASSWORD =====
+(async () => {
+    try {
+        const adminEmail = 'admin@hotelbooking.com';
+        const adminPassword = 'admin123';
+        const hashedPassword = await bcrypt.hash(adminPassword, 10);
+        await pool.query(
+            `INSERT INTO users (email, password_hash, user_type, full_name, is_verified)
+             VALUES ($1, $2, 'admin', 'Super Admin', TRUE)
+             ON CONFLICT (email) DO UPDATE SET password_hash = $2
+             WHERE users.email = $1`,
+            [adminEmail, hashedPassword]
+        );
+        console.log('✅ Admin user verified');
+    } catch (error) {
+        console.error('❌ Error ensuring admin user:', error);
+    }
+})();
 
-const isHotelFeatured = async (hotelId) => {
-    const result = await pool.query(
-        `SELECT is_featured, featured_expiry FROM hotels WHERE id = $1`,
-        [hotelId]
-    );
-    if (result.rows.length === 0) return false;
-    const hotel = result.rows[0];
-    if (!hotel.is_featured) return false;
-    if (!hotel.featured_expiry) return false;
-    return new Date(hotel.featured_expiry) > new Date();
-};
+// ===== DIAGNOSTIC ENDPOINT (remove later) =====
+app.get('/api/debug/check-admin', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT email, password_hash FROM users WHERE email = $1', ['admin@hotelbooking.com']);
+        if (result.rows.length === 0) {
+            return res.json({ exists: false });
+        }
+        const user = result.rows[0];
+        const hash = user.password_hash;
+        const isValid = hash.startsWith('$2a$') || hash.startsWith('$2b$') || hash.startsWith('$2y$');
+        res.json({ exists: true, hash_starts_with: hash.substring(0, 7), is_bcrypt: isValid });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 // ===== AUTH =====
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
     try {
-        const result = await pool.query(
-            'SELECT * FROM users WHERE email = $1',
-            [email]
-        );
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
         if (result.rows.length === 0) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
@@ -89,7 +94,6 @@ app.post('/api/auth/login', async (req, res) => {
 app.post('/api/auth/register', async (req, res) => {
     const { email, password, userType, companyName, fullName } = req.body;
     try {
-        // Check if user exists
         const exists = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
         if (exists.rows.length > 0) {
             return res.status(400).json({ error: 'Email already registered' });
@@ -146,10 +150,7 @@ const isHotelOwner = async (req, res, next) => {
         if (decoded.userType !== 'hotel') {
             return res.status(403).json({ error: 'Hotel owner only' });
         }
-        const result = await pool.query(
-            'SELECT * FROM hotels WHERE user_id = $1',
-            [decoded.id]
-        );
+        const result = await pool.query('SELECT * FROM hotels WHERE user_id = $1', [decoded.id]);
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'No hotel found' });
         }
@@ -170,12 +171,8 @@ app.get('/api/admin/stats', isAdmin, async (req, res) => {
             pool.query('SELECT COUNT(*) FROM rooms'),
             pool.query('SELECT COUNT(*) FROM reviews')
         ]);
-        const totalPhotos = await pool.query(
-            'SELECT SUM(array_length(photos, 1)) FROM hotels'
-        );
-        const recent = await pool.query(
-            'SELECT id, hotel_name, city, created_at FROM hotels ORDER BY created_at DESC LIMIT 5'
-        );
+        const totalPhotos = await pool.query('SELECT SUM(array_length(photos, 1)) FROM hotels');
+        const recent = await pool.query('SELECT id, hotel_name, city, created_at FROM hotels ORDER BY created_at DESC LIMIT 5');
         res.json({
             totalHotels: parseInt(stats[0].rows[0].count),
             totalUsers: parseInt(stats[1].rows[0].count),
@@ -236,10 +233,7 @@ app.post('/api/admin/hotels', isAdmin, async (req, res) => {
 
     try {
         // Find or create owner
-        let owner = await pool.query(
-            'SELECT id FROM users WHERE email = $1 AND user_type = $2',
-            [ownerEmail, 'hotel']
-        );
+        let owner = await pool.query('SELECT id FROM users WHERE email = $1 AND user_type = $2', [ownerEmail, 'hotel']);
         let userId;
         if (owner.rows.length > 0) {
             userId = owner.rows[0].id;
@@ -315,9 +309,7 @@ app.delete('/api/admin/hotels/:id', isAdmin, async (req, res) => {
 
 app.get('/api/admin/users', isAdmin, async (req, res) => {
     try {
-        const result = await pool.query(
-            'SELECT id, email, user_type, company_name, full_name, created_at FROM users ORDER BY created_at DESC'
-        );
+        const result = await pool.query('SELECT id, email, user_type, company_name, full_name, created_at FROM users ORDER BY created_at DESC');
         res.json(result.rows);
     } catch (error) {
         console.error(error);
@@ -326,6 +318,24 @@ app.get('/api/admin/users', isAdmin, async (req, res) => {
 });
 
 // ===== HOTEL OWNER ROUTES =====
+const isHotelVisible = async (hotelId) => {
+    const result = await pool.query('SELECT is_active, subscription_expiry FROM hotels WHERE id = $1', [hotelId]);
+    if (result.rows.length === 0) return false;
+    const hotel = result.rows[0];
+    if (!hotel.is_active) return false;
+    if (!hotel.subscription_expiry) return false;
+    return new Date(hotel.subscription_expiry) > new Date();
+};
+
+const isHotelFeatured = async (hotelId) => {
+    const result = await pool.query('SELECT is_featured, featured_expiry FROM hotels WHERE id = $1', [hotelId]);
+    if (result.rows.length === 0) return false;
+    const hotel = result.rows[0];
+    if (!hotel.is_featured) return false;
+    if (!hotel.featured_expiry) return false;
+    return new Date(hotel.featured_expiry) > new Date();
+};
+
 app.get('/api/hotels/me', isHotelOwner, async (req, res) => {
     const hotel = req.hotel;
     const visible = await isHotelVisible(hotel.id);
@@ -371,10 +381,7 @@ app.post('/api/hotels/me/photos', isHotelOwner, async (req, res) => {
         return res.status(400).json({ error: 'Maximum 5 photos allowed' });
     }
     try {
-        await pool.query(
-            'UPDATE hotels SET photos = $1 WHERE id = $2',
-            [photos || [], req.hotel.id]
-        );
+        await pool.query('UPDATE hotels SET photos = $1 WHERE id = $2', [photos || [], req.hotel.id]);
         res.json({ message: 'Photos updated', photos: photos || [] });
     } catch (error) {
         console.error(error);
@@ -390,10 +397,7 @@ app.post('/api/payments/subscribe', isHotelOwner, async (req, res) => {
     try {
         const expiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         if (amount === 1000) {
-            await pool.query(
-                'UPDATE hotels SET subscription_expiry = $1 WHERE id = $2',
-                [expiry, hotelId]
-            );
+            await pool.query('UPDATE hotels SET subscription_expiry = $1 WHERE id = $2', [expiry, hotelId]);
             await pool.query(
                 'INSERT INTO subscriptions (hotel_id, amount, type, payment_method, expires_at) VALUES ($1, $2, $3, $4, $5)',
                 [hotelId, 1000, 'subscription', paymentMethod || 'mpesa', expiry]
@@ -438,10 +442,7 @@ app.post('/api/rooms', isHotelOwner, async (req, res) => {
 app.get('/api/rooms/hotel/:hotelId', async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     try {
-        const result = await pool.query(
-            'SELECT * FROM rooms WHERE hotel_id = $1 ORDER BY id',
-            [hotelId]
-        );
+        const result = await pool.query('SELECT * FROM rooms WHERE hotel_id = $1 ORDER BY id', [hotelId]);
         res.json(result.rows);
     } catch (error) {
         console.error(error);
@@ -494,10 +495,7 @@ app.put('/api/rooms/:id', isHotelOwner, async (req, res) => {
 app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
     const id = parseInt(req.params.id);
     try {
-        const result = await pool.query(
-            'DELETE FROM rooms WHERE id = $1 AND hotel_id = $2 RETURNING id',
-            [id, req.hotel.id]
-        );
+        const result = await pool.query('DELETE FROM rooms WHERE id = $1 AND hotel_id = $2 RETURNING id', [id, req.hotel.id]);
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'Room not found' });
         }
@@ -528,10 +526,7 @@ app.post('/api/conference', isHotelOwner, async (req, res) => {
 app.get('/api/conference/hotel/:hotelId', async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     try {
-        const result = await pool.query(
-            'SELECT * FROM conference_rooms WHERE hotel_id = $1 ORDER BY id',
-            [hotelId]
-        );
+        const result = await pool.query('SELECT * FROM conference_rooms WHERE hotel_id = $1 ORDER BY id', [hotelId]);
         res.json(result.rows);
     } catch (error) {
         console.error(error);
@@ -568,10 +563,7 @@ app.post('/api/conference/bookings', isHotelOwner, async (req, res) => {
 app.get('/api/conference/hotel/:hotelId/availability', async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     try {
-        const confs = await pool.query(
-            'SELECT * FROM conference_rooms WHERE hotel_id = $1',
-            [hotelId]
-        );
+        const confs = await pool.query('SELECT * FROM conference_rooms WHERE hotel_id = $1', [hotelId]);
         const result = await Promise.all(confs.rows.map(async (c) => {
             const bookings = await pool.query(
                 `SELECT booking_date as date, start_time as start, end_time as end
@@ -611,7 +603,6 @@ app.get('/api/hotels/public', async (req, res) => {
             WHERE h.is_active = TRUE AND h.subscription_expiry > NOW()
             ORDER BY h.is_featured DESC, h.created_at DESC
         `);
-        // Add featured status
         const featuredMap = {};
         const featuredHotels = await pool.query(
             'SELECT id FROM hotels WHERE is_featured = TRUE AND featured_expiry > NOW()'
@@ -673,7 +664,6 @@ app.get('/api/hotels/featured', async (req, res) => {
 app.get('/api/hotels/:id', async (req, res) => {
     const id = parseInt(req.params.id);
     try {
-        // Check visibility
         const visible = await isHotelVisible(id);
         if (!visible) {
             return res.status(403).json({ error: 'Hotel is currently unavailable' });
@@ -690,7 +680,6 @@ app.get('/api/hotels/:id', async (req, res) => {
         }
         const hotel = hotelResult.rows[0];
 
-        // Check access (client paid)
         let hasAccess = false;
         const token = req.headers.authorization?.split(' ')[1];
         if (token) {
@@ -705,23 +694,12 @@ app.get('/api/hotels/:id', async (req, res) => {
             } catch (e) { /* ignore */ }
         }
 
-        // Get rooms
-        const rooms = await pool.query(
-            'SELECT * FROM rooms WHERE hotel_id = $1',
-            [id]
-        );
-        // Get conference rooms
-        const confs = await pool.query(
-            'SELECT * FROM conference_rooms WHERE hotel_id = $1',
-            [id]
-        );
-        // Get reviews
+        const rooms = await pool.query('SELECT * FROM rooms WHERE hotel_id = $1', [id]);
+        const confs = await pool.query('SELECT * FROM conference_rooms WHERE hotel_id = $1', [id]);
         const reviews = await pool.query(
             'SELECT id, user_name, rating, comment, created_at FROM reviews WHERE hotel_id = $1 ORDER BY created_at DESC',
             [id]
         );
-
-        // Featured status
         const featured = await isHotelFeatured(id);
 
         const response = {
@@ -776,10 +754,7 @@ app.post('/api/reviews', async (req, res) => {
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const userId = decoded.id;
-        const user = await pool.query(
-            'SELECT full_name, email FROM users WHERE id = $1',
-            [userId]
-        );
+        const user = await pool.query('SELECT full_name, email FROM users WHERE id = $1', [userId]);
         if (user.rows.length === 0) {
             return res.status(404).json({ error: 'User not found' });
         }
@@ -797,7 +772,7 @@ app.post('/api/reviews', async (req, res) => {
     }
 });
 
-// ===== PAYMENTS (Client Unlock) =====
+// ===== PAYMENTS =====
 const UNLOCK_PRICE = 100;
 
 app.post('/api/payments/mpesa/confirm', async (req, res) => {
@@ -808,8 +783,6 @@ app.post('/api/payments/mpesa/confirm', async (req, res) => {
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
-        // Simulate payment success – in production, verify via M-Pesa API
-        // Check if already paid
         const existing = await pool.query(
             'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2',
             [clientId, hotel_id]
@@ -841,7 +814,6 @@ app.post('/api/payments/card/confirm', async (req, res) => {
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
-        // Simulate card payment success
         const existing = await pool.query(
             'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2',
             [clientId, hotel_id]
