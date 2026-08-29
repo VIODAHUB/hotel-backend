@@ -14,7 +14,9 @@ app.use(cors({ origin: '*' }));
 // ===== DATABASE CONNECTION =====
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }  // required for Supabase
+    ssl: {
+        rejectUnauthorized: false   // Disables SSL certificate verification
+    }
 });
 
 // Test connection
