@@ -860,7 +860,23 @@ app.get('/api/hotels/:id/access', async (req, res) => {
         res.json({ hasAccess: false });
     }
 });
-
+// ===== PUBLIC REVIEWS (for landing page) =====
+app.get('/api/reviews/public', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT r.*, h.hotel_name, u.email as reviewer_email
+            FROM reviews r
+            JOIN hotels h ON r.hotel_id = h.id
+            JOIN users u ON r.user_id = u.id
+            ORDER BY r.created_at DESC
+            LIMIT 20
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
 // ===== START SERVER =====
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
