@@ -17,7 +17,6 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// Test connection
 pool.connect((err) => {
     if (err) console.error('❌ Database connection error:', err);
     else console.log('✅ Connected to PostgreSQL');
@@ -42,7 +41,7 @@ pool.connect((err) => {
     }
 })();
 
-// ===== DIAGNOSTIC ENDPOINT =====
+// ===== DIAGNOSTIC =====
 app.get('/api/debug/check-admin', async (req, res) => {
     try {
         const result = await pool.query('SELECT email, password_hash FROM users WHERE email = $1', ['admin@hotelbooking.com']);
@@ -162,7 +161,8 @@ const isHotelOwner = async (req, res, next) => {
     }
 };
 
-// ===== ADMIN ROUTES =====
+// ======================= ADMIN ROUTES =======================
+
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
     try {
         const stats = await Promise.all([
@@ -312,7 +312,8 @@ app.get('/api/admin/users', isAdmin, async (req, res) => {
     }
 });
 
-// ===== HOTEL OWNER ROUTES =====
+// ======================= HOTEL OWNER ROUTES =======================
+
 const isHotelVisible = async (hotelId) => {
     const result = await pool.query('SELECT is_active, subscription_expiry FROM hotels WHERE id = $1', [hotelId]);
     if (result.rows.length === 0) return false;
@@ -388,7 +389,7 @@ app.post('/api/hotels/me/photos', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== SUBSCRIPTION =====
+// Subscription
 app.post('/api/payments/subscribe', isHotelOwner, async (req, res) => {
     const { amount, paymentMethod } = req.body;
     const hotelId = req.hotel.id;
@@ -420,7 +421,7 @@ app.post('/api/payments/subscribe', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== ROOMS =====
+// Rooms
 app.post('/api/rooms', isHotelOwner, async (req, res) => {
     const { roomTypeName, capacity, basePricePerNight, totalRooms } = req.body;
     try {
@@ -504,7 +505,7 @@ app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== CONFERENCE =====
+// Conference
 app.post('/api/conference', isHotelOwner, async (req, res) => {
     const { roomName, capacity, pricePerHour } = req.body;
     try {
@@ -577,7 +578,263 @@ app.get('/api/conference/hotel/:hotelId/availability', async (req, res) => {
     }
 });
 
-// ===== PUBLIC ROUTES =====
+// ======================= MENU MANAGEMENT (Owner) =======================
+
+app.get('/api/menu/hotel/:hotelId', async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    try {
+        const result = await pool.query(
+            'SELECT * FROM hotel_menu WHERE hotel_id = $1 AND is_available = TRUE ORDER BY category, item_name',
+            [hotelId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+app.post('/api/menu', isHotelOwner, async (req, res) => {
+    const { item_name, description, price, category } = req.body;
+    try {
+        const result = await pool.query(
+            `INSERT INTO hotel_menu (hotel_id, item_name, description, price, category)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING *`,
+            [req.hotel.id, item_name, description, price, category || 'main']
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to add menu item' });
+    }
+});
+
+app.put('/api/menu/:id', isHotelOwner, async (req, res) => {
+    const id = parseInt(req.params.id);
+    const { item_name, description, price, category, is_available } = req.body;
+    try {
+        const check = await pool.query(
+            'SELECT hotel_id FROM hotel_menu WHERE id = $1',
+            [id]
+        );
+        if (check.rows.length === 0 || check.rows[0].hotel_id !== req.hotel.id) {
+            return res.status(404).json({ error: 'Menu item not found' });
+        }
+        const result = await pool.query(
+            `UPDATE hotel_menu SET
+                item_name = COALESCE($1, item_name),
+                description = COALESCE($2, description),
+                price = COALESCE($3, price),
+                category = COALESCE($4, category),
+                is_available = COALESCE($5, is_available)
+             WHERE id = $6
+             RETURNING *`,
+            [item_name, description, price, category, is_available, id]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to update menu item' });
+    }
+});
+
+app.delete('/api/menu/:id', isHotelOwner, async (req, res) => {
+    const id = parseInt(req.params.id);
+    try {
+        const check = await pool.query(
+            'SELECT hotel_id FROM hotel_menu WHERE id = $1',
+            [id]
+        );
+        if (check.rows.length === 0 || check.rows[0].hotel_id !== req.hotel.id) {
+            return res.status(404).json({ error: 'Menu item not found' });
+        }
+        await pool.query('DELETE FROM hotel_menu WHERE id = $1', [id]);
+        res.json({ message: 'Menu item deleted' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to delete menu item' });
+    }
+});
+
+// ======================= FOOD ORDERS (Client) =======================
+
+app.post('/api/food-orders', async (req, res) => {
+    const { hotel_id, items, pickup_date, pickup_time, special_instructions } = req.body;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Please login first' });
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+        const clientId = decoded.id;
+
+        let total = 0;
+        items.forEach(item => total += item.price * item.quantity);
+
+        const result = await pool.query(
+            `INSERT INTO food_orders (client_id, hotel_id, items, total_amount, pickup_date, pickup_time, special_instructions, payment_status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+             RETURNING *`,
+            [clientId, hotel_id, JSON.stringify(items), total, pickup_date, pickup_time, special_instructions || '']
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to place order' });
+    }
+});
+
+app.get('/api/food-orders/client', async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Please login' });
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+        const result = await pool.query(
+            'SELECT * FROM food_orders WHERE client_id = $1 ORDER BY created_at DESC',
+            [decoded.id]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+app.post('/api/food-orders/:id/confirm-payment', async (req, res) => {
+    const orderId = parseInt(req.params.id);
+    const { payment_method, payment_reference } = req.body;
+    try {
+        const result = await pool.query(
+            `UPDATE food_orders SET
+                payment_status = 'paid',
+                payment_method = $1,
+                payment_reference = $2,
+                status = 'confirmed'
+             WHERE id = $3
+             RETURNING *`,
+            [payment_method, payment_reference, orderId]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to confirm payment' });
+    }
+});
+
+// ======================= ROOM BOOKINGS (Client) =======================
+
+app.get('/api/rooms/hotel/:hotelId/available', async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    const { check_in, check_out } = req.query;
+    try {
+        const rooms = await pool.query(
+            'SELECT * FROM rooms WHERE hotel_id = $1 AND is_available = TRUE',
+            [hotelId]
+        );
+        res.json(rooms.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+app.post('/api/room-bookings', async (req, res) => {
+    const { room_type_id, check_in_date, check_out_date, number_of_guests, special_requests } = req.body;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Please login first' });
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+        const clientId = decoded.id;
+
+        const room = await pool.query(
+            'SELECT r.*, h.id as hotel_id FROM rooms r JOIN hotels h ON r.hotel_id = h.id WHERE r.id = $1',
+            [room_type_id]
+        );
+        if (room.rows.length === 0) {
+            return res.status(404).json({ error: 'Room not found' });
+        }
+
+        const days = Math.ceil((new Date(check_out_date) - new Date(check_in_date)) / (1000 * 60 * 60 * 24));
+        const total = room.rows[0].base_price_per_night * days;
+
+        const result = await pool.query(
+            `INSERT INTO room_bookings (client_id, hotel_id, room_type_id, check_in_date, check_out_date, 
+                number_of_guests, total_amount, special_requests, payment_status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+             RETURNING *`,
+            [clientId, room.rows[0].hotel_id, room_type_id, check_in_date, check_out_date, number_of_guests || 1, total, special_requests || '']
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to book room' });
+    }
+});
+
+app.post('/api/room-bookings/:id/confirm-payment', async (req, res) => {
+    const bookingId = parseInt(req.params.id);
+    const { payment_method, payment_reference } = req.body;
+    try {
+        const result = await pool.query(
+            `UPDATE room_bookings SET
+                payment_status = 'paid',
+                payment_method = $1,
+                payment_reference = $2,
+                status = 'confirmed'
+             WHERE id = $3
+             RETURNING *`,
+            [payment_method, payment_reference, bookingId]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to confirm payment' });
+    }
+});
+
+// ======================= PAYMENT ROUTING =======================
+
+app.put('/api/hotels/me/payment-settings', isHotelOwner, async (req, res) => {
+    const { payment_method, mpesa_till, paybill_number, bank_details } = req.body;
+    try {
+        const result = await pool.query(
+            `UPDATE hotels SET
+                payment_method = COALESCE($1, payment_method),
+                mpesa_till = COALESCE($2, mpesa_till),
+                paybill_number = COALESCE($3, paybill_number),
+                bank_details = COALESCE($4, bank_details)
+             WHERE id = $5
+             RETURNING *`,
+            [payment_method, mpesa_till, paybill_number, bank_details, req.hotel.id]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Update failed' });
+    }
+});
+
+app.get('/api/hotels/:id/payment-settings', async (req, res) => {
+    const hotelId = parseInt(req.params.id);
+    try {
+        const result = await pool.query(
+            'SELECT payment_method, mpesa_till, paybill_number FROM hotels WHERE id = $1',
+            [hotelId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Hotel not found' });
+        }
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ======================= PUBLIC ROUTES =======================
+
 app.get('/api/hotels/public', async (req, res) => {
     try {
         const hotels = await pool.query(`
@@ -705,6 +962,12 @@ app.get('/api/hotels/:id', async (req, res) => {
         );
         const featured = await isHotelFeatured(id);
 
+        // Get menu items
+        const menu = await pool.query(
+            'SELECT * FROM hotel_menu WHERE hotel_id = $1 AND is_available = TRUE ORDER BY category, item_name',
+            [id]
+        );
+
         const response = {
             id: hotel.id,
             hotel_name: hotel.hotel_name,
@@ -738,6 +1001,7 @@ app.get('/api/hotels/:id', async (req, res) => {
                 comment: r.comment,
                 created_at: r.created_at
             })),
+            menu: menu.rows,
             meals: hotel.meals || [],
             drinks: hotel.drinks || [],
             whats_new: hotel.whats_new || '',
@@ -751,7 +1015,8 @@ app.get('/api/hotels/:id', async (req, res) => {
     }
 });
 
-// ===== REVIEWS =====
+// ======================= REVIEWS =======================
+
 app.post('/api/reviews', async (req, res) => {
     const { hotel_id, rating, comment } = req.body;
     const token = req.headers.authorization?.split(' ')[1];
@@ -778,7 +1043,25 @@ app.post('/api/reviews', async (req, res) => {
     }
 });
 
-// ===== PAYMENTS =====
+app.get('/api/reviews/public', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT r.*, h.hotel_name, u.email as reviewer_email
+            FROM reviews r
+            JOIN hotels h ON r.hotel_id = h.id
+            JOIN users u ON r.user_id = u.id
+            ORDER BY r.created_at DESC
+            LIMIT 20
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ======================= PAYMENTS (Client Unlock) =======================
+
 const UNLOCK_PRICE = 100;
 
 app.post('/api/payments/mpesa/confirm', async (req, res) => {
@@ -860,24 +1143,8 @@ app.get('/api/hotels/:id/access', async (req, res) => {
         res.json({ hasAccess: false });
     }
 });
-// ===== PUBLIC REVIEWS (for landing page) =====
-app.get('/api/reviews/public', async (req, res) => {
-    try {
-        const result = await pool.query(`
-            SELECT r.*, h.hotel_name, u.email as reviewer_email
-            FROM reviews r
-            JOIN hotels h ON r.hotel_id = h.id
-            JOIN users u ON r.user_id = u.id
-            ORDER BY r.created_at DESC
-            LIMIT 20
-        `);
-        res.json(result.rows);
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-// ===== START SERVER =====
+
+// ======================= START SERVER =======================
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`👤 Admin: admin@hotelbooking.com / admin123`);
