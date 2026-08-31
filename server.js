@@ -23,7 +23,7 @@ pool.connect((err) => {
     else console.log('✅ Connected to PostgreSQL');
 });
 
-// ===== ENSURE ADMIN USER EXISTS WITH CORRECT PASSWORD =====
+// ===== ENSURE ADMIN USER EXISTS =====
 (async () => {
     try {
         const adminEmail = 'admin@hotelbooking.com';
@@ -42,7 +42,7 @@ pool.connect((err) => {
     }
 })();
 
-// ===== DIAGNOSTIC ENDPOINT (remove later) =====
+// ===== DIAGNOSTIC ENDPOINT =====
 app.get('/api/debug/check-admin', async (req, res) => {
     try {
         const result = await pool.query('SELECT email, password_hash FROM users WHERE email = $1', ['admin@hotelbooking.com']);
@@ -152,11 +152,7 @@ const isHotelOwner = async (req, res, next) => {
         }
         const result = await pool.query('SELECT * FROM hotels WHERE user_id = $1', [decoded.id]);
         if (result.rows.length === 0) {
-            // No hotel found – we'll let the owner create one
-            req.userId = decoded.id;
-            req.hotel = null; // no hotel yet
-            next();
-            return;
+            return res.status(404).json({ error: 'No hotel found' });
         }
         req.userId = decoded.id;
         req.hotel = result.rows[0];
@@ -201,7 +197,6 @@ app.get('/api/admin/hotels', isAdmin, async (req, res) => {
             LEFT JOIN users u ON h.user_id = u.id
             ORDER BY h.created_at DESC
         `);
-        // Add visibility and featured status
         const hotels = await Promise.all(result.rows.map(async (h) => {
             const visible = await isHotelVisible(h.id);
             const featured = await isHotelFeatured(h.id);
@@ -230,13 +225,10 @@ app.get('/api/admin/hotels/:id', isAdmin, async (req, res) => {
 
 app.post('/api/admin/hotels', isAdmin, async (req, res) => {
     const { hotelName, ownerEmail, phone, city, country, address, description, starRating, isActive, photos } = req.body;
-
     if (photos && photos.length > 5) {
         return res.status(400).json({ error: 'Maximum 5 photos allowed' });
     }
-
     try {
-        // Find or create owner
         let owner = await pool.query('SELECT id FROM users WHERE email = $1 AND user_type = $2', [ownerEmail, 'hotel']);
         let userId;
         if (owner.rows.length > 0) {
@@ -253,13 +245,12 @@ app.post('/api/admin/hotels', isAdmin, async (req, res) => {
             userId = newUser.rows[0].id;
             console.log(`🆕 Created owner: ${ownerEmail}, password: ${tempPassword}`);
         }
-
         const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         const result = await pool.query(
-            `INSERT INTO hotels (user_id, hotel_name, phone, city, country, address, description, star_rating, is_active, photos, subscription_expiry)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            `INSERT INTO hotels (user_id, hotel_name, phone, city, country, address, description, star_rating, is_active, photos, subscription_expiry, meals, drinks, whats_new)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
              RETURNING *`,
-            [userId, hotelName, phone || '', city, country, address || '', description || '', starRating || 3, isActive !== undefined ? isActive : true, photos || [], subscriptionExpiry]
+            [userId, hotelName, phone || '', city, country, address || '', description || '', starRating || 3, isActive !== undefined ? isActive : true, photos || [], subscriptionExpiry, '[]', '[]', '']
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -340,12 +331,7 @@ const isHotelFeatured = async (hotelId) => {
     return new Date(hotel.featured_expiry) > new Date();
 };
 
-// Get owner's hotel
 app.get('/api/hotels/me', isHotelOwner, async (req, res) => {
-    if (!req.hotel) {
-        // No hotel yet – return 404 so the frontend can handle it
-        return res.status(404).json({ error: 'No hotel found' });
-    }
     const hotel = req.hotel;
     const visible = await isHotelVisible(hotel.id);
     const featured = await isHotelFeatured(hotel.id);
@@ -360,12 +346,9 @@ app.get('/api/hotels/me', isHotelOwner, async (req, res) => {
     });
 });
 
-// Update owner's hotel
 app.put('/api/hotels/me', isHotelOwner, async (req, res) => {
-    if (!req.hotel) {
-        return res.status(404).json({ error: 'No hotel found' });
-    }
-    const { hotelName, phone, city, country, address, description, starRating } = req.body;
+    const { hotelName, phone, city, country, address, description, starRating, meals, drinks, whats_new } = req.body;
+    const hotelId = req.hotel.id;
     try {
         const result = await pool.query(
             `UPDATE hotels SET
@@ -376,10 +359,13 @@ app.put('/api/hotels/me', isHotelOwner, async (req, res) => {
                 address = COALESCE($5, address),
                 description = COALESCE($6, description),
                 star_rating = COALESCE($7, star_rating),
+                meals = COALESCE($8, meals),
+                drinks = COALESCE($9, drinks),
+                whats_new = COALESCE($10, whats_new),
                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $8
+             WHERE id = $11
              RETURNING *`,
-            [hotelName, phone, city, country, address, description, starRating, req.hotel.id]
+            [hotelName, phone, city, country, address, description, starRating, meals, drinks, whats_new, hotelId]
         );
         res.json(result.rows[0]);
     } catch (error) {
@@ -388,11 +374,7 @@ app.put('/api/hotels/me', isHotelOwner, async (req, res) => {
     }
 });
 
-// Upload photos
 app.post('/api/hotels/me/photos', isHotelOwner, async (req, res) => {
-    if (!req.hotel) {
-        return res.status(404).json({ error: 'No hotel found' });
-    }
     const { photos } = req.body;
     if (photos && photos.length > 5) {
         return res.status(400).json({ error: 'Maximum 5 photos allowed' });
@@ -406,38 +388,10 @@ app.post('/api/hotels/me/photos', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== NEW: Hotel owner creates a hotel =====
-app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
-    if (req.hotel) {
-        return res.status(400).json({ error: 'You already have a hotel' });
-    }
-    const { hotelName, city, country, phone } = req.body;
-    if (!hotelName) {
-        return res.status(400).json({ error: 'Hotel name is required' });
-    }
-    try {
-        const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-        const result = await pool.query(
-            `INSERT INTO hotels (user_id, hotel_name, city, country, phone, subscription_expiry, is_active)
-             VALUES ($1, $2, $3, $4, $5, $6, TRUE)
-             RETURNING *`,
-            [req.userId, hotelName, city || '', country || '', phone || '', subscriptionExpiry]
-        );
-        res.status(201).json(result.rows[0]);
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Failed to create hotel' });
-    }
-});
-
 // ===== SUBSCRIPTION =====
 app.post('/api/payments/subscribe', isHotelOwner, async (req, res) => {
-    if (!req.hotel) {
-        return res.status(404).json({ error: 'No hotel found' });
-    }
-    const { amount, paymentMethod } = req.body; // 1000 or 5000
+    const { amount, paymentMethod } = req.body;
     const hotelId = req.hotel.id;
-
     try {
         const expiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         if (amount === 1000) {
@@ -468,9 +422,6 @@ app.post('/api/payments/subscribe', isHotelOwner, async (req, res) => {
 
 // ===== ROOMS =====
 app.post('/api/rooms', isHotelOwner, async (req, res) => {
-    if (!req.hotel) {
-        return res.status(404).json({ error: 'No hotel found' });
-    }
     const { roomTypeName, capacity, basePricePerNight, totalRooms } = req.body;
     try {
         const result = await pool.query(
@@ -498,9 +449,6 @@ app.get('/api/rooms/hotel/:hotelId', async (req, res) => {
 });
 
 app.put('/api/rooms/:id/toggle', isHotelOwner, async (req, res) => {
-    if (!req.hotel) {
-        return res.status(404).json({ error: 'No hotel found' });
-    }
     const id = parseInt(req.params.id);
     const { is_available } = req.body;
     try {
@@ -519,9 +467,6 @@ app.put('/api/rooms/:id/toggle', isHotelOwner, async (req, res) => {
 });
 
 app.put('/api/rooms/:id', isHotelOwner, async (req, res) => {
-    if (!req.hotel) {
-        return res.status(404).json({ error: 'No hotel found' });
-    }
     const id = parseInt(req.params.id);
     const { room_type_name, capacity, base_price_per_night, total_rooms } = req.body;
     try {
@@ -546,9 +491,6 @@ app.put('/api/rooms/:id', isHotelOwner, async (req, res) => {
 });
 
 app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
-    if (!req.hotel) {
-        return res.status(404).json({ error: 'No hotel found' });
-    }
     const id = parseInt(req.params.id);
     try {
         const result = await pool.query('DELETE FROM rooms WHERE id = $1 AND hotel_id = $2 RETURNING id', [id, req.hotel.id]);
@@ -564,9 +506,6 @@ app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
 
 // ===== CONFERENCE =====
 app.post('/api/conference', isHotelOwner, async (req, res) => {
-    if (!req.hotel) {
-        return res.status(404).json({ error: 'No hotel found' });
-    }
     const { roomName, capacity, pricePerHour } = req.body;
     try {
         const result = await pool.query(
@@ -594,12 +533,8 @@ app.get('/api/conference/hotel/:hotelId', async (req, res) => {
 });
 
 app.post('/api/conference/bookings', isHotelOwner, async (req, res) => {
-    if (!req.hotel) {
-        return res.status(404).json({ error: 'No hotel found' });
-    }
     const { conferenceRoomId, bookingDate, startTime, endTime, purpose } = req.body;
     try {
-        // Check conflict
         const conflict = await pool.query(
             `SELECT id FROM conference_bookings
              WHERE conference_room_id = $1 AND booking_date = $2 AND status = 'confirmed'
@@ -681,7 +616,10 @@ app.get('/api/hotels/public', async (req, res) => {
             photos: h.photos || [],
             is_featured: !!featuredMap[h.id],
             room_types: h.room_types || [],
-            conference_rooms: h.conference_rooms || []
+            conference_rooms: h.conference_rooms || [],
+            meals: h.meals || [],
+            drinks: h.drinks || [],
+            whats_new: h.whats_new || ''
         }));
         res.json(publicList);
     } catch (error) {
@@ -714,7 +652,10 @@ app.get('/api/hotels/featured', async (req, res) => {
             star_rating: h.star_rating,
             description: h.description,
             photos: h.photos || [],
-            room_types: h.room_types || []
+            room_types: h.room_types || [],
+            meals: h.meals || [],
+            drinks: h.drinks || [],
+            whats_new: h.whats_new || ''
         }));
         res.json(featured);
     } catch (error) {
@@ -797,6 +738,9 @@ app.get('/api/hotels/:id', async (req, res) => {
                 comment: r.comment,
                 created_at: r.created_at
             })),
+            meals: hotel.meals || [],
+            drinks: hotel.drinks || [],
+            whats_new: hotel.whats_new || '',
             hasAccess: hasAccess,
             unlockPrice: 100
         };
