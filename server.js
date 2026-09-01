@@ -171,9 +171,11 @@ app.get('/api/admin/stats', isAdmin, async (req, res) => {
             pool.query('SELECT COUNT(*) FROM rooms'),
             pool.query('SELECT COUNT(*) FROM reviews')
         ]);
+        const clients = await pool.query('SELECT COUNT(*) FROM users WHERE user_type = $1', ['client']);
         const totalPhotos = await pool.query('SELECT SUM(array_length(photos, 1)) FROM hotels');
         const recent = await pool.query('SELECT id, hotel_name, city, created_at FROM hotels ORDER BY created_at DESC LIMIT 5');
         res.json({
+            totalClients: parseInt(clients.rows[0].count),
             totalHotels: parseInt(stats[0].rows[0].count),
             totalUsers: parseInt(stats[1].rows[0].count),
             totalRooms: parseInt(stats[2].rows[0].count),
