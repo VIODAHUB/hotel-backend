@@ -169,17 +169,17 @@ app.get('/api/admin/stats', isAdmin, async (req, res) => {
             pool.query('SELECT COUNT(*) FROM hotels'),
             pool.query('SELECT COUNT(*) FROM users WHERE user_type != $1', ['admin']),
             pool.query('SELECT COUNT(*) FROM rooms'),
-            pool.query('SELECT COUNT(*) FROM reviews')
+            pool.query('SELECT COUNT(*) FROM reviews'),
+            pool.query('SELECT COUNT(*) FROM users WHERE user_type = $1', ['client']) // ✅ NEW: clients count
         ]);
-        const clients = await pool.query('SELECT COUNT(*) FROM users WHERE user_type = $1', ['client']);
         const totalPhotos = await pool.query('SELECT SUM(array_length(photos, 1)) FROM hotels');
         const recent = await pool.query('SELECT id, hotel_name, city, created_at FROM hotels ORDER BY created_at DESC LIMIT 5');
         res.json({
-            totalClients: parseInt(clients.rows[0].count),
             totalHotels: parseInt(stats[0].rows[0].count),
             totalUsers: parseInt(stats[1].rows[0].count),
             totalRooms: parseInt(stats[2].rows[0].count),
             totalReviews: parseInt(stats[3].rows[0].count),
+            totalClients: parseInt(stats[4].rows[0].count), // ✅ NEW
             totalPhotos: totalPhotos.rows[0].sum || 0,
             recentHotels: recent.rows
         });
@@ -1065,6 +1065,7 @@ app.get('/api/reviews/public', async (req, res) => {
 // ======================= PAYMENTS (Client Unlock) =======================
 
 const UNLOCK_PRICE = 100;
+const UNLOCK_EXPIRY_DAYS = 7; // ✅ changed from 30 to 7
 
 app.post('/api/payments/mpesa/confirm', async (req, res) => {
     const { hotel_id, phone_number, till_number, amount } = req.body;
@@ -1081,13 +1082,13 @@ app.post('/api/payments/mpesa/confirm', async (req, res) => {
         if (existing.rows.length > 0) {
             await pool.query(
                 'UPDATE payments SET paid = TRUE, expires_at = $1 WHERE client_id = $2 AND hotel_id = $3',
-                [new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), clientId, hotel_id]
+                [new Date(Date.now() + UNLOCK_EXPIRY_DAYS * 24 * 60 * 60 * 1000), clientId, hotel_id]
             );
         } else {
             await pool.query(
                 `INSERT INTO payments (client_id, hotel_id, paid, session_id, amount, expires_at)
                  VALUES ($1, $2, TRUE, $3, $4, $5)`,
-                [clientId, hotel_id, 'mpesa_' + Date.now(), UNLOCK_PRICE, new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)]
+                [clientId, hotel_id, 'mpesa_' + Date.now(), UNLOCK_PRICE, new Date(Date.now() + UNLOCK_EXPIRY_DAYS * 24 * 60 * 60 * 1000)]
             );
         }
         res.json({ success: true, message: 'M-Pesa payment confirmed' });
@@ -1112,13 +1113,13 @@ app.post('/api/payments/card/confirm', async (req, res) => {
         if (existing.rows.length > 0) {
             await pool.query(
                 'UPDATE payments SET paid = TRUE, expires_at = $1 WHERE client_id = $2 AND hotel_id = $3',
-                [new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), clientId, hotel_id]
+                [new Date(Date.now() + UNLOCK_EXPIRY_DAYS * 24 * 60 * 60 * 1000), clientId, hotel_id]
             );
         } else {
             await pool.query(
                 `INSERT INTO payments (client_id, hotel_id, paid, session_id, amount, expires_at)
                  VALUES ($1, $2, TRUE, $3, $4, $5)`,
-                [clientId, hotel_id, 'card_' + Date.now(), UNLOCK_PRICE, new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)]
+                [clientId, hotel_id, 'card_' + Date.now(), UNLOCK_PRICE, new Date(Date.now() + UNLOCK_EXPIRY_DAYS * 24 * 60 * 60 * 1000)]
             );
         }
         res.json({ success: true, message: 'Card payment confirmed' });
