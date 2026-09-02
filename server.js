@@ -21,7 +21,6 @@ pool.connect((err) => {
     else console.log('✅ Connected to PostgreSQL');
 });
 
-// Ensure admin user exists
 (async () => {
     try {
         const adminEmail = 'admin@hotelbooking.com';
@@ -229,8 +228,6 @@ app.post('/api/admin/hotels', isAdmin, async (req, res) => {
             userId = newUser.rows[0].id;
             console.log(`🆕 Created owner: ${ownerEmail}, password: ${tempPassword}`);
         }
-
-        // Ensure subscription expiry is set to 30 days from now
         const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         const result = await pool.query(
             `INSERT INTO hotels (user_id, hotel_name, phone, city, country, address, description, star_rating, is_active, photos, subscription_expiry, meals, drinks, whats_new)
@@ -371,6 +368,28 @@ app.post('/api/hotels/me/photos', isHotelOwner, async (req, res) => {
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Update failed' });
+    }
+});
+
+// ===== HOTEL OWNER CREATES HOTEL (NEW) =====
+app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
+    const { hotelName, city, country, phone } = req.body;
+    try {
+        const existing = await pool.query('SELECT id FROM hotels WHERE user_id = $1', [req.userId]);
+        if (existing.rows.length > 0) {
+            return res.status(400).json({ error: 'You already have a hotel' });
+        }
+        const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        const result = await pool.query(
+            `INSERT INTO hotels (user_id, hotel_name, city, country, phone, subscription_expiry, is_active)
+             VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+             RETURNING *`,
+            [req.userId, hotelName || 'My Hotel', city || '', country || '', phone || '', subscriptionExpiry]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to create hotel' });
     }
 });
 
