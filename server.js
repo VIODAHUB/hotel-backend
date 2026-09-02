@@ -11,7 +11,6 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(cors({ origin: '*' }));
 
-// ===== DATABASE CONNECTION =====
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
@@ -22,7 +21,7 @@ pool.connect((err) => {
     else console.log('✅ Connected to PostgreSQL');
 });
 
-// ===== ENSURE ADMIN USER EXISTS =====
+// Ensure admin user exists
 (async () => {
     try {
         const adminEmail = 'admin@hotelbooking.com';
@@ -40,22 +39,6 @@ pool.connect((err) => {
         console.error('❌ Error ensuring admin user:', error);
     }
 })();
-
-// ===== DIAGNOSTIC =====
-app.get('/api/debug/check-admin', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT email, password_hash FROM users WHERE email = $1', ['admin@hotelbooking.com']);
-        if (result.rows.length === 0) {
-            return res.json({ exists: false });
-        }
-        const user = result.rows[0];
-        const hash = user.password_hash;
-        const isValid = hash.startsWith('$2a$') || hash.startsWith('$2b$') || hash.startsWith('$2y$');
-        res.json({ exists: true, hash_starts_with: hash.substring(0, 7), is_bcrypt: isValid });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
 
 // ===== AUTH =====
 app.post('/api/auth/login', async (req, res) => {
@@ -151,7 +134,7 @@ const isHotelOwner = async (req, res, next) => {
         }
         const result = await pool.query('SELECT * FROM hotels WHERE user_id = $1', [decoded.id]);
         if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'No hotel found' });
+            return res.status(404).json({ error: 'No hotel found for this owner' });
         }
         req.userId = decoded.id;
         req.hotel = result.rows[0];
@@ -161,8 +144,7 @@ const isHotelOwner = async (req, res, next) => {
     }
 };
 
-// ======================= ADMIN ROUTES =======================
-
+// ===== ADMIN ROUTES =====
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
     try {
         const stats = await Promise.all([
@@ -170,7 +152,7 @@ app.get('/api/admin/stats', isAdmin, async (req, res) => {
             pool.query('SELECT COUNT(*) FROM users WHERE user_type != $1', ['admin']),
             pool.query('SELECT COUNT(*) FROM rooms'),
             pool.query('SELECT COUNT(*) FROM reviews'),
-            pool.query('SELECT COUNT(*) FROM users WHERE user_type = $1', ['client']) // ✅ NEW: clients count
+            pool.query('SELECT COUNT(*) FROM users WHERE user_type = $1', ['client'])
         ]);
         const totalPhotos = await pool.query('SELECT SUM(array_length(photos, 1)) FROM hotels');
         const recent = await pool.query('SELECT id, hotel_name, city, created_at FROM hotels ORDER BY created_at DESC LIMIT 5');
@@ -179,7 +161,7 @@ app.get('/api/admin/stats', isAdmin, async (req, res) => {
             totalUsers: parseInt(stats[1].rows[0].count),
             totalRooms: parseInt(stats[2].rows[0].count),
             totalReviews: parseInt(stats[3].rows[0].count),
-            totalClients: parseInt(stats[4].rows[0].count), // ✅ NEW
+            totalClients: parseInt(stats[4].rows[0].count),
             totalPhotos: totalPhotos.rows[0].sum || 0,
             recentHotels: recent.rows
         });
@@ -247,6 +229,8 @@ app.post('/api/admin/hotels', isAdmin, async (req, res) => {
             userId = newUser.rows[0].id;
             console.log(`🆕 Created owner: ${ownerEmail}, password: ${tempPassword}`);
         }
+
+        // Ensure subscription expiry is set to 30 days from now
         const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         const result = await pool.query(
             `INSERT INTO hotels (user_id, hotel_name, phone, city, country, address, description, star_rating, is_active, photos, subscription_expiry, meals, drinks, whats_new)
@@ -314,8 +298,7 @@ app.get('/api/admin/users', isAdmin, async (req, res) => {
     }
 });
 
-// ======================= HOTEL OWNER ROUTES =======================
-
+// ===== HOTEL OWNER ROUTES =====
 const isHotelVisible = async (hotelId) => {
     const result = await pool.query('SELECT is_active, subscription_expiry FROM hotels WHERE id = $1', [hotelId]);
     if (result.rows.length === 0) return false;
@@ -391,7 +374,7 @@ app.post('/api/hotels/me/photos', isHotelOwner, async (req, res) => {
     }
 });
 
-// Subscription
+// ===== SUBSCRIPTION =====
 app.post('/api/payments/subscribe', isHotelOwner, async (req, res) => {
     const { amount, paymentMethod } = req.body;
     const hotelId = req.hotel.id;
@@ -423,7 +406,7 @@ app.post('/api/payments/subscribe', isHotelOwner, async (req, res) => {
     }
 });
 
-// Rooms
+// ===== ROOMS =====
 app.post('/api/rooms', isHotelOwner, async (req, res) => {
     const { roomTypeName, capacity, basePricePerNight, totalRooms } = req.body;
     try {
@@ -507,7 +490,7 @@ app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
     }
 });
 
-// Conference
+// ===== CONFERENCE =====
 app.post('/api/conference', isHotelOwner, async (req, res) => {
     const { roomName, capacity, pricePerHour } = req.body;
     try {
@@ -580,8 +563,7 @@ app.get('/api/conference/hotel/:hotelId/availability', async (req, res) => {
     }
 });
 
-// ======================= MENU MANAGEMENT (Owner) =======================
-
+// ===== MENU =====
 app.get('/api/menu/hotel/:hotelId', async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     try {
@@ -659,8 +641,7 @@ app.delete('/api/menu/:id', isHotelOwner, async (req, res) => {
     }
 });
 
-// ======================= FOOD ORDERS (Client) =======================
-
+// ===== FOOD ORDERS =====
 app.post('/api/food-orders', async (req, res) => {
     const { hotel_id, items, pickup_date, pickup_time, special_instructions } = req.body;
     const token = req.headers.authorization?.split(' ')[1];
@@ -724,8 +705,7 @@ app.post('/api/food-orders/:id/confirm-payment', async (req, res) => {
     }
 });
 
-// ======================= ROOM BOOKINGS (Client) =======================
-
+// ===== ROOM BOOKINGS =====
 app.get('/api/rooms/hotel/:hotelId/available', async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     const { check_in, check_out } = req.query;
@@ -796,8 +776,7 @@ app.post('/api/room-bookings/:id/confirm-payment', async (req, res) => {
     }
 });
 
-// ======================= PAYMENT ROUTING =======================
-
+// ===== PAYMENT ROUTING =====
 app.put('/api/hotels/me/payment-settings', isHotelOwner, async (req, res) => {
     const { payment_method, mpesa_till, paybill_number, bank_details } = req.body;
     try {
@@ -835,8 +814,7 @@ app.get('/api/hotels/:id/payment-settings', async (req, res) => {
     }
 });
 
-// ======================= PUBLIC ROUTES =======================
-
+// ===== PUBLIC ROUTES =====
 app.get('/api/hotels/public', async (req, res) => {
     try {
         const hotels = await pool.query(`
@@ -856,7 +834,7 @@ app.get('/api/hotels/public', async (req, res) => {
                         'price_per_hour', c.price_per_hour
                    )) FROM conference_rooms c WHERE c.hotel_id = h.id) as conference_rooms
             FROM hotels h
-            WHERE h.is_active = TRUE AND h.subscription_expiry > NOW()
+            WHERE h.is_active = TRUE AND (h.subscription_expiry IS NOT NULL AND h.subscription_expiry > NOW())
             ORDER BY h.is_featured DESC, h.created_at DESC
         `);
         const featuredMap = {};
@@ -900,7 +878,7 @@ app.get('/api/hotels/featured', async (req, res) => {
                         'is_available', r.is_available
                    )) FROM rooms r WHERE r.hotel_id = h.id) as room_types
             FROM hotels h
-            WHERE h.is_featured = TRUE AND h.featured_expiry > NOW() AND h.is_active = TRUE AND h.subscription_expiry > NOW()
+            WHERE h.is_featured = TRUE AND h.featured_expiry > NOW() AND h.is_active = TRUE AND (h.subscription_expiry IS NOT NULL AND h.subscription_expiry > NOW())
             ORDER BY h.created_at DESC
         `);
         const featured = result.rows.map(h => ({
@@ -964,7 +942,6 @@ app.get('/api/hotels/:id', async (req, res) => {
         );
         const featured = await isHotelFeatured(id);
 
-        // Get menu items
         const menu = await pool.query(
             'SELECT * FROM hotel_menu WHERE hotel_id = $1 AND is_available = TRUE ORDER BY category, item_name',
             [id]
@@ -1017,8 +994,7 @@ app.get('/api/hotels/:id', async (req, res) => {
     }
 });
 
-// ======================= REVIEWS =======================
-
+// ===== REVIEWS =====
 app.post('/api/reviews', async (req, res) => {
     const { hotel_id, rating, comment } = req.body;
     const token = req.headers.authorization?.split(' ')[1];
@@ -1062,10 +1038,9 @@ app.get('/api/reviews/public', async (req, res) => {
     }
 });
 
-// ======================= PAYMENTS (Client Unlock) =======================
-
+// ===== PAYMENTS (Client Unlock) =====
 const UNLOCK_PRICE = 100;
-const UNLOCK_EXPIRY_DAYS = 7; // ✅ changed from 30 to 7
+const UNLOCK_EXPIRY_DAYS = 7;
 
 app.post('/api/payments/mpesa/confirm', async (req, res) => {
     const { hotel_id, phone_number, till_number, amount } = req.body;
@@ -1147,7 +1122,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ======================= START SERVER =======================
+// ===== START SERVER =====
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`👤 Admin: admin@hotelbooking.com / admin123`);
