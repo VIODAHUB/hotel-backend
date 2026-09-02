@@ -131,19 +131,14 @@ const isHotelOwner = async (req, res, next) => {
         if (decoded.userType !== 'hotel') {
             return res.status(403).json({ error: 'Hotel owner only' });
         }
-        const result = await pool.query('SELECT * FROM hotels WHERE user_id = $1', [decoded.id]);
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'No hotel found for this owner' });
-        }
         req.userId = decoded.id;
-        req.hotel = result.rows[0];
         next();
     } catch {
         res.status(401).json({ error: 'Invalid token' });
     }
 };
 
-// ===== ADMIN ROUTES =====
+// ===== ADMIN ROUTES (unchanged) =====
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
     try {
         const stats = await Promise.all([
@@ -295,7 +290,7 @@ app.get('/api/admin/users', isAdmin, async (req, res) => {
     }
 });
 
-// ===== HOTEL OWNER ROUTES =====
+// ===== HOTEL OWNER ROUTES (multi-hotel) =====
 const isHotelVisible = async (hotelId) => {
     const result = await pool.query('SELECT is_active, subscription_expiry FROM hotels WHERE id = $1', [hotelId]);
     if (result.rows.length === 0) return false;
@@ -314,25 +309,76 @@ const isHotelFeatured = async (hotelId) => {
     return new Date(hotel.featured_expiry) > new Date();
 };
 
-app.get('/api/hotels/me', isHotelOwner, async (req, res) => {
-    const hotel = req.hotel;
-    const visible = await isHotelVisible(hotel.id);
-    const featured = await isHotelFeatured(hotel.id);
-    const daysLeft = hotel.subscription_expiry ?
-        Math.max(0, Math.ceil((new Date(hotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
-        0;
-    res.json({
-        ...hotel,
-        is_visible: visible,
-        is_featured_active: featured,
-        subscription_days_left: daysLeft
-    });
+// Get all hotels for the logged-in owner
+app.get('/api/hotels/owner', isHotelOwner, async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM hotels WHERE user_id = $1 ORDER BY created_at DESC',
+            [req.userId]
+        );
+        // Add visibility and featured status for each hotel
+        const hotels = await Promise.all(result.rows.map(async (h) => {
+            const visible = await isHotelVisible(h.id);
+            const featured = await isHotelFeatured(h.id);
+            const daysLeft = h.subscription_expiry ?
+                Math.max(0, Math.ceil((new Date(h.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
+                0;
+            return {
+                ...h,
+                is_visible: visible,
+                is_featured_active: featured,
+                subscription_days_left: daysLeft
+            };
+        }));
+        res.json(hotels);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
-app.put('/api/hotels/me', isHotelOwner, async (req, res) => {
-    const { hotelName, phone, city, country, address, description, starRating, meals, drinks, whats_new } = req.body;
-    const hotelId = req.hotel.id;
+// Get single hotel details (for the owner to manage)
+app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.id);
     try {
+        const result = await pool.query(
+            'SELECT * FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Hotel not found or not owned by you' });
+        }
+        const hotel = result.rows[0];
+        const visible = await isHotelVisible(hotel.id);
+        const featured = await isHotelFeatured(hotel.id);
+        const daysLeft = hotel.subscription_expiry ?
+            Math.max(0, Math.ceil((new Date(hotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
+            0;
+        res.json({
+            ...hotel,
+            is_visible: visible,
+            is_featured_active: featured,
+            subscription_days_left: daysLeft
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Update hotel (owner can update any of their hotels)
+app.put('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.id);
+    const { hotelName, phone, city, country, address, description, starRating, meals, drinks, whats_new } = req.body;
+    try {
+        // Verify ownership
+        const check = await pool.query(
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Hotel not found or not owned by you' });
+        }
         const result = await pool.query(
             `UPDATE hotels SET
                 hotel_name = COALESCE($1, hotel_name),
@@ -357,13 +403,22 @@ app.put('/api/hotels/me', isHotelOwner, async (req, res) => {
     }
 });
 
-app.post('/api/hotels/me/photos', isHotelOwner, async (req, res) => {
+// Upload photos for a specific hotel
+app.post('/api/hotels/owner/:id/photos', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.id);
     const { photos } = req.body;
     if (photos && photos.length > 5) {
         return res.status(400).json({ error: 'Maximum 5 photos allowed' });
     }
     try {
-        await pool.query('UPDATE hotels SET photos = $1 WHERE id = $2', [photos || [], req.hotel.id]);
+        const check = await pool.query(
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Hotel not found or not owned by you' });
+        }
+        await pool.query('UPDATE hotels SET photos = $1 WHERE id = $2', [photos || [], hotelId]);
         res.json({ message: 'Photos updated', photos: photos || [] });
     } catch (error) {
         console.error(error);
@@ -371,20 +426,16 @@ app.post('/api/hotels/me/photos', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== HOTEL OWNER CREATES HOTEL (NEW) =====
+// Create a new hotel for the owner
 app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
-    const { hotelName, city, country, phone } = req.body;
+    const { hotelName, city, country, phone, address, description, starRating } = req.body;
     try {
-        const existing = await pool.query('SELECT id FROM hotels WHERE user_id = $1', [req.userId]);
-        if (existing.rows.length > 0) {
-            return res.status(400).json({ error: 'You already have a hotel' });
-        }
         const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         const result = await pool.query(
-            `INSERT INTO hotels (user_id, hotel_name, city, country, phone, subscription_expiry, is_active)
-             VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+            `INSERT INTO hotels (user_id, hotel_name, city, country, phone, address, description, star_rating, subscription_expiry, is_active)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
              RETURNING *`,
-            [req.userId, hotelName || 'My Hotel', city || '', country || '', phone || '', subscriptionExpiry]
+            [req.userId, hotelName || 'My Hotel', city || '', country || '', phone || '', address || '', description || '', starRating || 3, subscriptionExpiry]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -393,11 +444,19 @@ app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== SUBSCRIPTION =====
-app.post('/api/payments/subscribe', isHotelOwner, async (req, res) => {
+// ===== SUBSCRIPTION (for a specific hotel) =====
+app.post('/api/payments/subscribe/:hotelId', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
     const { amount, paymentMethod } = req.body;
-    const hotelId = req.hotel.id;
     try {
+        // Verify ownership
+        const check = await pool.query(
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Hotel not found or not owned by you' });
+        }
         const expiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         if (amount === 1000) {
             await pool.query('UPDATE hotels SET subscription_expiry = $1 WHERE id = $2', [expiry, hotelId]);
@@ -425,15 +484,23 @@ app.post('/api/payments/subscribe', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== ROOMS =====
-app.post('/api/rooms', isHotelOwner, async (req, res) => {
+// ===== ROOMS (for a specific hotel) =====
+app.post('/api/rooms/:hotelId', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
     const { roomTypeName, capacity, basePricePerNight, totalRooms } = req.body;
     try {
+        const check = await pool.query(
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Hotel not found or not owned by you' });
+        }
         const result = await pool.query(
             `INSERT INTO rooms (hotel_id, room_type_name, capacity, base_price_per_night, total_rooms, is_available)
              VALUES ($1, $2, $3, $4, $5, TRUE)
              RETURNING *`,
-            [req.hotel.id, roomTypeName, capacity, basePricePerNight, totalRooms]
+            [hotelId, roomTypeName, capacity, basePricePerNight, totalRooms]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -457,13 +524,20 @@ app.put('/api/rooms/:id/toggle', isHotelOwner, async (req, res) => {
     const id = parseInt(req.params.id);
     const { is_available } = req.body;
     try {
-        const result = await pool.query(
-            'UPDATE rooms SET is_available = $1 WHERE id = $2 AND hotel_id = $3 RETURNING *',
-            [is_available, id, req.hotel.id]
+        // Verify the room belongs to a hotel owned by this user
+        const check = await pool.query(
+            `SELECT r.id FROM rooms r
+             JOIN hotels h ON r.hotel_id = h.id
+             WHERE r.id = $1 AND h.user_id = $2`,
+            [id, req.userId]
         );
-        if (result.rows.length === 0) {
+        if (check.rows.length === 0) {
             return res.status(404).json({ error: 'Room not found' });
         }
+        const result = await pool.query(
+            'UPDATE rooms SET is_available = $1 WHERE id = $2 RETURNING *',
+            [is_available, id]
+        );
         res.json(result.rows[0]);
     } catch (error) {
         console.error(error);
@@ -475,19 +549,25 @@ app.put('/api/rooms/:id', isHotelOwner, async (req, res) => {
     const id = parseInt(req.params.id);
     const { room_type_name, capacity, base_price_per_night, total_rooms } = req.body;
     try {
+        const check = await pool.query(
+            `SELECT r.id FROM rooms r
+             JOIN hotels h ON r.hotel_id = h.id
+             WHERE r.id = $1 AND h.user_id = $2`,
+            [id, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Room not found' });
+        }
         const result = await pool.query(
             `UPDATE rooms SET
                 room_type_name = COALESCE($1, room_type_name),
                 capacity = COALESCE($2, capacity),
                 base_price_per_night = COALESCE($3, base_price_per_night),
                 total_rooms = COALESCE($4, total_rooms)
-             WHERE id = $5 AND hotel_id = $6
+             WHERE id = $5
              RETURNING *`,
-            [room_type_name, capacity, base_price_per_night, total_rooms, id, req.hotel.id]
+            [room_type_name, capacity, base_price_per_night, total_rooms, id]
         );
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Room not found' });
-        }
         res.json(result.rows[0]);
     } catch (error) {
         console.error(error);
@@ -498,10 +578,16 @@ app.put('/api/rooms/:id', isHotelOwner, async (req, res) => {
 app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
     const id = parseInt(req.params.id);
     try {
-        const result = await pool.query('DELETE FROM rooms WHERE id = $1 AND hotel_id = $2 RETURNING id', [id, req.hotel.id]);
-        if (result.rows.length === 0) {
+        const check = await pool.query(
+            `SELECT r.id FROM rooms r
+             JOIN hotels h ON r.hotel_id = h.id
+             WHERE r.id = $1 AND h.user_id = $2`,
+            [id, req.userId]
+        );
+        if (check.rows.length === 0) {
             return res.status(404).json({ error: 'Room not found' });
         }
+        await pool.query('DELETE FROM rooms WHERE id = $1', [id]);
         res.json({ message: 'Deleted' });
     } catch (error) {
         console.error(error);
@@ -509,15 +595,23 @@ app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== CONFERENCE =====
-app.post('/api/conference', isHotelOwner, async (req, res) => {
+// ===== CONFERENCE (for a specific hotel) =====
+app.post('/api/conference/:hotelId', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
     const { roomName, capacity, pricePerHour } = req.body;
     try {
+        const check = await pool.query(
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Hotel not found or not owned by you' });
+        }
         const result = await pool.query(
             `INSERT INTO conference_rooms (hotel_id, room_name, capacity, price_per_hour, is_available)
              VALUES ($1, $2, $3, $4, TRUE)
              RETURNING *`,
-            [req.hotel.id, roomName, capacity, pricePerHour]
+            [hotelId, roomName, capacity, pricePerHour]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -540,6 +634,15 @@ app.get('/api/conference/hotel/:hotelId', async (req, res) => {
 app.post('/api/conference/bookings', isHotelOwner, async (req, res) => {
     const { conferenceRoomId, bookingDate, startTime, endTime, purpose } = req.body;
     try {
+        const check = await pool.query(
+            `SELECT c.id FROM conference_rooms c
+             JOIN hotels h ON c.hotel_id = h.id
+             WHERE c.id = $1 AND h.user_id = $2`,
+            [conferenceRoomId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Conference room not found' });
+        }
         const conflict = await pool.query(
             `SELECT id FROM conference_bookings
              WHERE conference_room_id = $1 AND booking_date = $2 AND status = 'confirmed'
@@ -582,7 +685,7 @@ app.get('/api/conference/hotel/:hotelId/availability', async (req, res) => {
     }
 });
 
-// ===== MENU =====
+// ===== MENU (for a specific hotel) =====
 app.get('/api/menu/hotel/:hotelId', async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     try {
@@ -597,14 +700,22 @@ app.get('/api/menu/hotel/:hotelId', async (req, res) => {
     }
 });
 
-app.post('/api/menu', isHotelOwner, async (req, res) => {
+app.post('/api/menu/:hotelId', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
     const { item_name, description, price, category } = req.body;
     try {
+        const check = await pool.query(
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Hotel not found or not owned by you' });
+        }
         const result = await pool.query(
             `INSERT INTO hotel_menu (hotel_id, item_name, description, price, category)
              VALUES ($1, $2, $3, $4, $5)
              RETURNING *`,
-            [req.hotel.id, item_name, description, price, category || 'main']
+            [hotelId, item_name, description, price, category || 'main']
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -618,10 +729,12 @@ app.put('/api/menu/:id', isHotelOwner, async (req, res) => {
     const { item_name, description, price, category, is_available } = req.body;
     try {
         const check = await pool.query(
-            'SELECT hotel_id FROM hotel_menu WHERE id = $1',
-            [id]
+            `SELECT m.id FROM hotel_menu m
+             JOIN hotels h ON m.hotel_id = h.id
+             WHERE m.id = $1 AND h.user_id = $2`,
+            [id, req.userId]
         );
-        if (check.rows.length === 0 || check.rows[0].hotel_id !== req.hotel.id) {
+        if (check.rows.length === 0) {
             return res.status(404).json({ error: 'Menu item not found' });
         }
         const result = await pool.query(
@@ -646,10 +759,12 @@ app.delete('/api/menu/:id', isHotelOwner, async (req, res) => {
     const id = parseInt(req.params.id);
     try {
         const check = await pool.query(
-            'SELECT hotel_id FROM hotel_menu WHERE id = $1',
-            [id]
+            `SELECT m.id FROM hotel_menu m
+             JOIN hotels h ON m.hotel_id = h.id
+             WHERE m.id = $1 AND h.user_id = $2`,
+            [id, req.userId]
         );
-        if (check.rows.length === 0 || check.rows[0].hotel_id !== req.hotel.id) {
+        if (check.rows.length === 0) {
             return res.status(404).json({ error: 'Menu item not found' });
         }
         await pool.query('DELETE FROM hotel_menu WHERE id = $1', [id]);
@@ -660,7 +775,7 @@ app.delete('/api/menu/:id', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== FOOD ORDERS =====
+// ===== FOOD ORDERS (unchanged) =====
 app.post('/api/food-orders', async (req, res) => {
     const { hotel_id, items, pickup_date, pickup_time, special_instructions } = req.body;
     const token = req.headers.authorization?.split(' ')[1];
@@ -724,7 +839,7 @@ app.post('/api/food-orders/:id/confirm-payment', async (req, res) => {
     }
 });
 
-// ===== ROOM BOOKINGS =====
+// ===== ROOM BOOKINGS (unchanged) =====
 app.get('/api/rooms/hotel/:hotelId/available', async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     const { check_in, check_out } = req.query;
