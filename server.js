@@ -74,53 +74,6 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// ===== FORGOT PASSWORD =====
-app.post('/api/auth/forgot-password', async (req, res) => {
-    const { email } = req.body;
-    try {
-        const user = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-        if (user.rows.length === 0) {
-            return res.status(404).json({ error: 'Email not found' });
-        }
-        const token = crypto.randomBytes(32).toString('hex');
-        const expires = new Date(Date.now() + 3600000);
-        await pool.query(
-            `INSERT INTO password_resets (user_id, token, expires_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (user_id) DO UPDATE SET token = $2, expires_at = $3`,
-            [user.rows[0].id, token, expires]
-        );
-        res.json({ success: true, message: 'Password reset link sent to your email', token });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.post('/api/auth/reset-password', async (req, res) => {
-    const { token, newPassword } = req.body;
-    try {
-        const reset = await pool.query(
-            'SELECT user_id FROM password_resets WHERE token = $1 AND expires_at > NOW()',
-            [token]
-        );
-        if (reset.rows.length === 0) {
-            return res.status(400).json({ error: 'Invalid or expired token' });
-        }
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
-        await pool.query(
-            'UPDATE users SET password_hash = $1 WHERE id = $2',
-            [hashedPassword, reset.rows[0].user_id]
-        );
-        await pool.query('DELETE FROM password_resets WHERE token = $1', [token]);
-        res.json({ success: true, message: 'Password reset successfully' });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// ===== REGISTER WITH OTP =====
 app.post('/api/auth/register', async (req, res) => {
     const { email, password, userType, companyName, fullName, phone } = req.body;
     try {
@@ -232,6 +185,11 @@ const isClient = async (req, res, next) => {
         res.status(401).json({ error: 'Invalid token' });
     }
 };
+
+// ===== TEST ENDPOINT =====
+app.get('/api/test', (req, res) => {
+    res.json({ message: 'Server is running!' });
+});
 
 // ======================= ADMIN ROUTES =======================
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
@@ -1234,11 +1192,12 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ===== MY BOOKINGS (FIXED - Returns JSON always) =====
+// ===== MY BOOKINGS - FIXED =====
 app.get('/api/my-bookings', isClient, async (req, res) => {
     try {
-        console.log('Fetching bookings for client:', req.userId);
+        console.log('📋 Fetching bookings for client:', req.userId);
 
+        // Get unlocked hotels
         const unlocked = await pool.query(
             `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
              FROM payments p
@@ -1248,6 +1207,7 @@ app.get('/api/my-bookings', isClient, async (req, res) => {
             [req.userId]
         );
 
+        // Get room bookings
         const roomBookings = await pool.query(
             `SELECT rb.*, r.room_type_name, h.hotel_name 
              FROM room_bookings rb
@@ -1258,6 +1218,7 @@ app.get('/api/my-bookings', isClient, async (req, res) => {
             [req.userId]
         );
 
+        // Get food orders
         const foodOrders = await pool.query(
             `SELECT fo.*, h.hotel_name 
              FROM food_orders fo
@@ -1267,16 +1228,15 @@ app.get('/api/my-bookings', isClient, async (req, res) => {
             [req.userId]
         );
 
-        // Always return valid JSON
         res.json({
             unlocked_hotels: unlocked.rows || [],
             room_bookings: roomBookings.rows || [],
             food_orders: foodOrders.rows || []
         });
     } catch (error) {
-        console.error('My bookings error:', error);
-        // Return empty data instead of error to avoid breaking the frontend
-        res.json({
+        console.error('❌ My bookings error:', error);
+        // Return empty data to avoid breaking the frontend
+        res.status(200).json({
             unlocked_hotels: [],
             room_bookings: [],
             food_orders: [],
@@ -1523,4 +1483,5 @@ app.get('/api/reviews/public', async (req, res) => {
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`👤 Admin: admin@hotelbooking.com / admin123`);
+    console.log(`✅ Test endpoint: /api/test`);
 });
