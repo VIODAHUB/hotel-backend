@@ -1234,12 +1234,11 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ===== MY BOOKINGS (FIXED) =====
+// ===== MY BOOKINGS (FIXED - Returns JSON always) =====
 app.get('/api/my-bookings', isClient, async (req, res) => {
     try {
         console.log('Fetching bookings for client:', req.userId);
 
-        // Get unlocked hotels
         const unlocked = await pool.query(
             `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
              FROM payments p
@@ -1249,7 +1248,6 @@ app.get('/api/my-bookings', isClient, async (req, res) => {
             [req.userId]
         );
 
-        // Get room bookings
         const roomBookings = await pool.query(
             `SELECT rb.*, r.room_type_name, h.hotel_name 
              FROM room_bookings rb
@@ -1260,7 +1258,6 @@ app.get('/api/my-bookings', isClient, async (req, res) => {
             [req.userId]
         );
 
-        // Get food orders
         const foodOrders = await pool.query(
             `SELECT fo.*, h.hotel_name 
              FROM food_orders fo
@@ -1270,14 +1267,21 @@ app.get('/api/my-bookings', isClient, async (req, res) => {
             [req.userId]
         );
 
+        // Always return valid JSON
         res.json({
-            unlocked_hotels: unlocked.rows,
-            room_bookings: roomBookings.rows,
-            food_orders: foodOrders.rows
+            unlocked_hotels: unlocked.rows || [],
+            room_bookings: roomBookings.rows || [],
+            food_orders: foodOrders.rows || []
         });
     } catch (error) {
         console.error('My bookings error:', error);
-        res.status(500).json({ error: 'Server error: ' + error.message });
+        // Return empty data instead of error to avoid breaking the frontend
+        res.json({
+            unlocked_hotels: [],
+            room_bookings: [],
+            food_orders: [],
+            error: error.message
+        });
     }
 });
 
