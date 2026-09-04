@@ -82,16 +82,14 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         if (user.rows.length === 0) {
             return res.status(404).json({ error: 'Email not found' });
         }
-        // Generate reset token (simulated)
         const token = crypto.randomBytes(32).toString('hex');
-        const expires = new Date(Date.now() + 3600000); // 1 hour
+        const expires = new Date(Date.now() + 3600000);
         await pool.query(
             `INSERT INTO password_resets (user_id, token, expires_at)
              VALUES ($1, $2, $3)
              ON CONFLICT (user_id) DO UPDATE SET token = $2, expires_at = $3`,
             [user.rows[0].id, token, expires]
         );
-        // In production, send email with reset link
         res.json({ success: true, message: 'Password reset link sent to your email', token });
     } catch (error) {
         console.error(error);
@@ -122,7 +120,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
     }
 });
 
-// ===== REGISTER WITH OTP (simulated) =====
+// ===== REGISTER WITH OTP =====
 app.post('/api/auth/register', async (req, res) => {
     const { email, password, userType, companyName, fullName, phone } = req.body;
     try {
@@ -137,19 +135,17 @@ app.post('/api/auth/register', async (req, res) => {
              RETURNING id, email, user_type, full_name`,
             [email, hashedPassword, userType, companyName || null, fullName || null, phone || null]
         );
-        // Generate OTP (simulated)
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        const expires = new Date(Date.now() + 600000); // 10 minutes
+        const expires = new Date(Date.now() + 600000);
         await pool.query(
             `INSERT INTO verifications (user_id, code, type, expires_at)
              VALUES ($1, $2, 'email', $3)`,
             [result.rows[0].id, otp, expires]
         );
-        // In production, send OTP via email/SMS
         res.json({
             success: true,
             message: 'OTP sent to your email',
-            otp: otp, // Remove in production!
+            otp: otp,
             userId: result.rows[0].id
         });
     } catch (error) {
@@ -170,7 +166,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         }
         await pool.query('UPDATE users SET is_verified = TRUE WHERE id = $1', [userId]);
         await pool.query('DELETE FROM verifications WHERE user_id = $1', [userId]);
-        // Generate token and login user
         const user = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
         const token = jwt.sign(
             { id: user.rows[0].id, userType: user.rows[0].user_type },
@@ -239,7 +234,6 @@ const isClient = async (req, res, next) => {
 };
 
 // ======================= ADMIN ROUTES =======================
-
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
     try {
         const stats = await Promise.all([
@@ -324,12 +318,12 @@ app.post('/api/admin/hotels', isAdmin, async (req, res) => {
             userId = newUser.rows[0].id;
             console.log(`🆕 Created owner: ${ownerEmail}, password: ${tempPassword}`);
         }
-        const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        // NEW: Set subscription_expiry to NULL initially (hotel not visible until subscription paid)
         const result = await pool.query(
             `INSERT INTO hotels (user_id, hotel_name, phone, city, country, address, description, star_rating, is_active, photos, subscription_expiry, meals, drinks, whats_new)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13)
              RETURNING *`,
-            [userId, hotelName, phone || '', city, country, address || '', description || '', starRating || 3, isActive !== undefined ? isActive : true, photos || [], subscriptionExpiry, '[]', '[]', '']
+            [userId, hotelName, phone || '', city, country, address || '', description || '', starRating || 3, isActive !== undefined ? isActive : true, photos || [], '[]', '[]', '']
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -454,7 +448,6 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             Math.max(0, Math.ceil((new Date(hotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
             0;
 
-        // Get bookings for this hotel
         const roomBookings = await pool.query(
             `SELECT rb.*, r.room_type_name 
              FROM room_bookings rb
@@ -471,10 +464,12 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
-        // Get room counts
+        // FIX 3: Correct room count calculation
         const roomStats = await pool.query(
-            `SELECT COUNT(*) as total_rooms, 
-                    SUM(CASE WHEN is_available THEN 1 ELSE 0 END) as available_rooms
+            `SELECT 
+                COUNT(*) as total_room_types,
+                SUM(total_rooms) as total_rooms,
+                SUM(CASE WHEN is_available THEN total_rooms ELSE 0 END) as available_rooms
              FROM rooms WHERE hotel_id = $1`,
             [hotelId]
         );
@@ -486,7 +481,7 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             subscription_days_left: daysLeft,
             room_bookings: roomBookings.rows,
             food_orders: foodOrders.rows,
-            room_stats: roomStats.rows[0] || { total_rooms: 0, available_rooms: 0 }
+            room_stats: roomStats.rows[0] || { total_room_types: 0, total_rooms: 0, available_rooms: 0 }
         });
     } catch (error) {
         console.error(error);
@@ -551,15 +546,16 @@ app.post('/api/hotels/owner/:id/photos', isHotelOwner, async (req, res) => {
     }
 });
 
+// FIX 7: New hotel not visible until subscription paid (subscription_expiry NULL)
 app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
     const { hotelName, city, country, phone, address, description, starRating } = req.body;
     try {
-        const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        // subscription_expiry = NULL (not visible until paid)
         const result = await pool.query(
             `INSERT INTO hotels (user_id, hotel_name, city, country, phone, address, description, star_rating, subscription_expiry, is_active)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, TRUE)
              RETURNING *`,
-            [req.userId, hotelName || 'My Hotel', city || '', country || '', phone || '', address || '', description || '', starRating || 3, subscriptionExpiry]
+            [req.userId, hotelName || 'My Hotel', city || '', country || '', phone || '', address || '', description || '', starRating || 3]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -568,7 +564,7 @@ app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== WALK-IN BOOKINGS (hotel owner books for client) =====
+// ===== WALK-IN BOOKINGS =====
 app.post('/api/room-bookings/walk-in', isHotelOwner, async (req, res) => {
     const { hotel_id, room_type_id, check_in_date, check_out_date, number_of_guests, client_name, client_phone, special_requests } = req.body;
     try {
@@ -880,7 +876,7 @@ app.get('/api/menu/hotel/:hotelId', async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     try {
         const result = await pool.query(
-            'SELECT * FROM hotel_menu WHERE hotel_id = $1 AND is_available = TRUE ORDER BY category, item_name',
+            'SELECT * FROM hotel_menu WHERE hotel_id = $1 ORDER BY category, item_name',
             [hotelId]
         );
         res.json(result.rows);
@@ -1029,10 +1025,31 @@ app.post('/api/food-orders/:id/confirm-payment', async (req, res) => {
     }
 });
 
+// FIX 1: Get single food order for receipt
+app.get('/api/food-orders/:id', async (req, res) => {
+    const id = parseInt(req.params.id);
+    try {
+        const result = await pool.query(
+            `SELECT fo.*, h.hotel_name 
+             FROM food_orders fo
+             JOIN hotels h ON fo.hotel_id = h.id
+             WHERE fo.id = $1`,
+            [id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Order not found' });
+        }
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 // ===== ROOM BOOKINGS (Client) =====
+// FIX 4: Return only available rooms (is_available = TRUE)
 app.get('/api/rooms/hotel/:hotelId/available', async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
-    const { check_in, check_out } = req.query;
     try {
         const rooms = await pool.query(
             'SELECT * FROM rooms WHERE hotel_id = $1 AND is_available = TRUE',
@@ -1055,11 +1072,11 @@ app.post('/api/room-bookings', async (req, res) => {
         const clientId = decoded.id;
 
         const room = await pool.query(
-            'SELECT r.*, h.id as hotel_id FROM rooms r JOIN hotels h ON r.hotel_id = h.id WHERE r.id = $1',
+            'SELECT r.*, h.id as hotel_id FROM rooms r JOIN hotels h ON r.hotel_id = h.id WHERE r.id = $1 AND r.is_available = TRUE',
             [room_type_id]
         );
         if (room.rows.length === 0) {
-            return res.status(404).json({ error: 'Room not found' });
+            return res.status(404).json({ error: 'Room not found or unavailable' });
         }
 
         const days = Math.ceil((new Date(check_out_date) - new Date(check_in_date)) / (1000 * 60 * 60 * 24));
@@ -1115,6 +1132,28 @@ app.post('/api/room-bookings/:id/confirm-payment', async (req, res) => {
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Failed to confirm payment' });
+    }
+});
+
+// FIX 1: Get single room booking for receipt
+app.get('/api/room-bookings/:id', async (req, res) => {
+    const id = parseInt(req.params.id);
+    try {
+        const result = await pool.query(
+            `SELECT rb.*, r.room_type_name, h.hotel_name 
+             FROM room_bookings rb
+             JOIN rooms r ON rb.room_type_id = r.id
+             JOIN hotels h ON rb.hotel_id = h.id
+             WHERE rb.id = $1`,
+            [id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Booking not found' });
+        }
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
@@ -1202,10 +1241,9 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ===== MY PURCHASES / BOOKINGS (Client) =====
+// ===== MY BOOKINGS =====
 app.get('/api/my-bookings', isClient, async (req, res) => {
     try {
-        // Get unlocked hotels
         const unlocked = await pool.query(
             `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
              FROM payments p
@@ -1215,7 +1253,6 @@ app.get('/api/my-bookings', isClient, async (req, res) => {
             [req.userId]
         );
 
-        // Get room bookings
         const roomBookings = await pool.query(
             `SELECT rb.*, r.room_type_name, h.hotel_name 
              FROM room_bookings rb
@@ -1226,7 +1263,6 @@ app.get('/api/my-bookings', isClient, async (req, res) => {
             [req.userId]
         );
 
-        // Get food orders
         const foodOrders = await pool.query(
             `SELECT fo.*, h.hotel_name 
              FROM food_orders fo
@@ -1248,6 +1284,7 @@ app.get('/api/my-bookings', isClient, async (req, res) => {
 });
 
 // ===== PUBLIC ROUTES =====
+// FIX 4: Only show available rooms (is_available = TRUE)
 app.get('/api/hotels/public', async (req, res) => {
     try {
         const hotels = await pool.query(`
@@ -1259,7 +1296,7 @@ app.get('/api/hotels/public', async (req, res) => {
                         'price_per_night', r.base_price_per_night,
                         'total_rooms', r.total_rooms,
                         'is_available', r.is_available
-                   )) FROM rooms r WHERE r.hotel_id = h.id) as room_types,
+                   )) FROM rooms r WHERE r.hotel_id = h.id AND r.is_available = TRUE) as room_types,
                    (SELECT json_agg(json_build_object(
                         'id', c.id,
                         'name', c.room_name,
@@ -1309,7 +1346,7 @@ app.get('/api/hotels/featured', async (req, res) => {
                         'price_per_night', r.base_price_per_night,
                         'total_rooms', r.total_rooms,
                         'is_available', r.is_available
-                   )) FROM rooms r WHERE r.hotel_id = h.id) as room_types
+                   )) FROM rooms r WHERE r.hotel_id = h.id AND r.is_available = TRUE) as room_types
             FROM hotels h
             WHERE h.is_featured = TRUE AND h.featured_expiry > NOW() AND h.is_active = TRUE AND (h.subscription_expiry IS NOT NULL AND h.subscription_expiry > NOW())
             ORDER BY h.created_at DESC
@@ -1367,7 +1404,11 @@ app.get('/api/hotels/:id', async (req, res) => {
             } catch (e) { /* ignore */ }
         }
 
-        const rooms = await pool.query('SELECT * FROM rooms WHERE hotel_id = $1', [id]);
+        // FIX 4: Only show available rooms
+        const rooms = await pool.query(
+            'SELECT * FROM rooms WHERE hotel_id = $1 AND is_available = TRUE',
+            [id]
+        );
         const confs = await pool.query('SELECT * FROM conference_rooms WHERE hotel_id = $1', [id]);
         const reviews = await pool.query(
             'SELECT id, user_name, rating, comment, created_at FROM reviews WHERE hotel_id = $1 ORDER BY created_at DESC',
@@ -1376,7 +1417,7 @@ app.get('/api/hotels/:id', async (req, res) => {
         const featured = await isHotelFeatured(id);
 
         const menu = await pool.query(
-            'SELECT * FROM hotel_menu WHERE hotel_id = $1 AND is_available = TRUE ORDER BY category, item_name',
+            'SELECT * FROM hotel_menu WHERE hotel_id = $1 ORDER BY category, item_name',
             [id]
         );
 
@@ -1413,7 +1454,14 @@ app.get('/api/hotels/:id', async (req, res) => {
                 comment: r.comment,
                 created_at: r.created_at
             })),
-            menu: menu.rows,
+            menu: menu.rows.map(m => ({
+                id: m.id,
+                item_name: m.item_name,
+                description: m.description,
+                price: m.price,
+                category: m.category,
+                is_available: m.is_available
+            })),
             meals: hotel.meals || [],
             drinks: hotel.drinks || [],
             whats_new: hotel.whats_new || '',
@@ -1468,24 +1516,6 @@ app.get('/api/reviews/public', async (req, res) => {
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.get('/api/hotels/:id/access', async (req, res) => {
-    const hotelId = parseInt(req.params.id);
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.json({ hasAccess: false });
-
-    try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
-        const clientId = decoded.id;
-        const result = await pool.query(
-            'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2 AND paid = TRUE AND expires_at > NOW()',
-            [clientId, hotelId]
-        );
-        res.json({ hasAccess: result.rows.length > 0 });
-    } catch (e) {
-        res.json({ hasAccess: false });
     }
 });
 
