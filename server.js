@@ -318,7 +318,6 @@ app.post('/api/admin/hotels', isAdmin, async (req, res) => {
             userId = newUser.rows[0].id;
             console.log(`🆕 Created owner: ${ownerEmail}, password: ${tempPassword}`);
         }
-        // NEW: Set subscription_expiry to NULL initially (hotel not visible until subscription paid)
         const result = await pool.query(
             `INSERT INTO hotels (user_id, hotel_name, phone, city, country, address, description, star_rating, is_active, photos, subscription_expiry, meals, drinks, whats_new)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13)
@@ -464,7 +463,6 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
-        // FIX 3: Correct room count calculation
         const roomStats = await pool.query(
             `SELECT 
                 COUNT(*) as total_room_types,
@@ -546,11 +544,9 @@ app.post('/api/hotels/owner/:id/photos', isHotelOwner, async (req, res) => {
     }
 });
 
-// FIX 7: New hotel not visible until subscription paid (subscription_expiry NULL)
 app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
     const { hotelName, city, country, phone, address, description, starRating } = req.body;
     try {
-        // subscription_expiry = NULL (not visible until paid)
         const result = await pool.query(
             `INSERT INTO hotels (user_id, hotel_name, city, country, phone, address, description, star_rating, subscription_expiry, is_active)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, TRUE)
@@ -1025,7 +1021,6 @@ app.post('/api/food-orders/:id/confirm-payment', async (req, res) => {
     }
 });
 
-// FIX 1: Get single food order for receipt
 app.get('/api/food-orders/:id', async (req, res) => {
     const id = parseInt(req.params.id);
     try {
@@ -1047,7 +1042,6 @@ app.get('/api/food-orders/:id', async (req, res) => {
 });
 
 // ===== ROOM BOOKINGS (Client) =====
-// FIX 4: Return only available rooms (is_available = TRUE)
 app.get('/api/rooms/hotel/:hotelId/available', async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     try {
@@ -1135,7 +1129,6 @@ app.post('/api/room-bookings/:id/confirm-payment', async (req, res) => {
     }
 });
 
-// FIX 1: Get single room booking for receipt
 app.get('/api/room-bookings/:id', async (req, res) => {
     const id = parseInt(req.params.id);
     try {
@@ -1278,13 +1271,12 @@ app.get('/api/my-bookings', isClient, async (req, res) => {
             food_orders: foodOrders.rows
         });
     } catch (error) {
-        console.error(error);
+        console.error('My bookings error:', error);
         res.status(500).json({ error: 'Server error' });
     }
 });
 
 // ===== PUBLIC ROUTES =====
-// FIX 4: Only show available rooms (is_available = TRUE)
 app.get('/api/hotels/public', async (req, res) => {
     try {
         const hotels = await pool.query(`
@@ -1404,7 +1396,6 @@ app.get('/api/hotels/:id', async (req, res) => {
             } catch (e) { /* ignore */ }
         }
 
-        // FIX 4: Only show available rooms
         const rooms = await pool.query(
             'SELECT * FROM rooms WHERE hotel_id = $1 AND is_available = TRUE',
             [id]
