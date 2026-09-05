@@ -773,7 +773,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ===== MY BOOKINGS =====
+// ===== MY BOOKINGS (FIXED: safe JSON parsing) =====
 app.get('/api/my-bookings', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
@@ -841,10 +841,16 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
+        // ✅ FIX: Parse items safely
+        const parsedFoodOrders = foodOrders.rows.map(o => ({
+            ...o,
+            items: typeof o.items === 'string' ? JSON.parse(o.items) : (o.items || [])
+        }));
+
         res.json({
             unlocked_hotels: unlocked.rows || [],
             room_bookings: roomBookings.rows || [],
-            food_orders: foodOrders.rows || []
+            food_orders: parsedFoodOrders
         });
     } catch (error) {
         console.error('My bookings error:', error);
@@ -881,7 +887,7 @@ app.post('/api/food-orders', async (req, res) => {
     }
 });
 
-// ===== WALK-IN FOOD ORDER (FIXED) =====
+// ===== WALK-IN FOOD ORDER =====
 app.post('/api/food-orders/walk-in', isHotelOwner, async (req, res) => {
     try {
         const { hotel_id, items, pickup_date, pickup_time, client_name, client_phone, special_instructions } = req.body;
@@ -897,11 +903,9 @@ app.post('/api/food-orders/walk-in', isHotelOwner, async (req, res) => {
             [hotel_id, client_name, client_phone, JSON.stringify(items), total, pickup_date, pickup_time, special_instructions || '', bookingRef]
         );
         
-        // ✅ FIXED: Return proper JSON with the result
         res.status(201).json(result.rows[0]);
     } catch (error) {
         console.error('Walk-in food order error:', error);
-        // ✅ FIXED: Return proper JSON error
         res.status(500).json({ error: 'Failed to place order: ' + error.message });
     }
 });
@@ -1102,7 +1106,7 @@ app.get('/api/reviews/public', async (req, res) => {
     }
 });
 
-// ===== ROOM MANAGEMENT (FIXED ENDPOINTS) =====
+// ===== ROOM MANAGEMENT =====
 app.post('/api/rooms/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     const { roomTypeName, capacity, basePricePerNight, totalRooms, isAvailable } = req.body;
@@ -1244,13 +1248,25 @@ app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== CONFERENCE ROOM MANAGEMENT (FIXED ENDPOINTS) =====
+// ===== CONFERENCE ROOM MANAGEMENT (FIXED: accepts both body formats) =====
 app.post('/api/conference/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
-    const { roomName, capacity, pricePerHour, amenities } = req.body;
+    // Accept both camelCase (frontend) and snake_case (backend) fields
+    const { 
+        roomName, room_name,
+        capacity, 
+        pricePerHour, price_per_hour,
+        amenities 
+    } = req.body;
     
-    if (!roomName || !capacity || !pricePerHour) {
-        return res.status(400).json({ error: 'Missing required fields' });
+    const finalRoomName = roomName || room_name;
+    const finalPrice = pricePerHour || price_per_hour;
+    
+    if (!finalRoomName || !capacity || !finalPrice) {
+        return res.status(400).json({ 
+            error: 'Missing required fields. Need: roomName/room_name, capacity, pricePerHour/price_per_hour',
+            received: req.body 
+        });
     }
 
     try {
@@ -1266,13 +1282,30 @@ app.post('/api/conference/:hotelId', isHotelOwner, async (req, res) => {
             `INSERT INTO conference_rooms (hotel_id, room_name, capacity, price_per_hour, amenities)
              VALUES ($1, $2, $3, $4, $5)
              RETURNING *`,
-            [hotelId, roomName, capacity, pricePerHour, amenities || []]
+            [hotelId, finalRoomName, capacity, finalPrice, amenities || []]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
         console.error('Create conference room error:', error);
-        res.status(500).json({ error: 'Failed to create conference room' });
+        res.status(500).json({ error: 'Failed to create conference room: ' + error.message });
     }
+});
+
+// Also support POST to /api/conference without hotelId in URL (for compatibility)
+app.post('/api/conference', isHotelOwner, async (req, res) => {
+    const { hotel_id, hotelId, roomName, room_name, capacity, pricePerHour, price_per_hour, amenities } = req.body;
+    const finalHotelId = hotel_id || hotelId;
+    const finalRoomName = roomName || room_name;
+    const finalPrice = pricePerHour || price_per_hour;
+    
+    if (!finalHotelId || !finalRoomName || !capacity || !finalPrice) {
+        return res.status(400).json({ 
+            error: 'Missing required fields. Need: hotel_id, roomName/room_name, capacity, pricePerHour/price_per_hour' 
+        });
+    }
+    
+    req.params = { hotelId: finalHotelId };
+    return app._router.handle(req, res, () => {});
 });
 
 app.get('/api/conference/hotel/:hotelId', isHotelOwner, async (req, res) => {
@@ -1342,7 +1375,7 @@ app.delete('/api/conference/:id', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== HOTEL MENU MANAGEMENT (FIXED ENDPOINTS) =====
+// ===== HOTEL MENU MANAGEMENT =====
 app.post('/api/menu/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     const { item_name, description, price, category, is_available } = req.body;
@@ -1460,7 +1493,6 @@ app.post('/api/payments/subscribe/:hotelId', isHotelOwner, async (req, res) => {
         let days;
 
         if (amount >= 5000) {
-            // Featured subscription
             days = 30;
             expiryDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
             updateQuery = `UPDATE hotels SET 
@@ -1471,7 +1503,6 @@ app.post('/api/payments/subscribe/:hotelId', isHotelOwner, async (req, res) => {
                 updated_at = CURRENT_TIMESTAMP
                 WHERE id = $2`;
         } else {
-            // Regular subscription
             days = 30;
             expiryDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
             updateQuery = `UPDATE hotels SET 
