@@ -170,6 +170,26 @@ const isHotelFeatured = async (hotelId) => {
     return expiry > new Date();
 };
 
+// ===== DEBUG ENDPOINT =====
+app.get('/api/debug/hotel/:id', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.id);
+    try {
+        const result = await pool.query(
+            'SELECT * FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Hotel not found' });
+        }
+        res.json({
+            hotel: result.rows[0],
+            columns: Object.keys(result.rows[0])
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ===== ADMIN ROUTES =====
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
     try {
@@ -349,6 +369,7 @@ app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
     }
 });
 
+// ===== GET SINGLE HOTEL DETAILS (FULLY SAFE) =====
 app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.id);
     try {
@@ -360,16 +381,41 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             return res.status(404).json({ error: 'Hotel not found or not owned by you' });
         }
         const hotel = result.rows[0];
-        const visible = await isHotelVisible(hotel.id);
-        const featured = await isHotelFeatured(hotel.id);
-        const daysLeft = hotel.subscription_expiry ?
-            Math.max(0, Math.ceil((new Date(hotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
+
+        // Safely get all values with fallbacks
+        const safeHotel = {
+            id: hotel.id || 0,
+            user_id: hotel.user_id || 0,
+            hotel_name: hotel.hotel_name || 'Unnamed Hotel',
+            phone: hotel.phone || '',
+            address: hotel.address || '',
+            city: hotel.city || '',
+            country: hotel.country || '',
+            star_rating: hotel.star_rating || 3,
+            description: hotel.description || '',
+            photos: hotel.photos || [],
+            is_active: hotel.is_active !== undefined ? hotel.is_active : true,
+            subscription_expiry: hotel.subscription_expiry || null,
+            is_featured: hotel.is_featured || false,
+            featured_expiry: hotel.featured_expiry || null,
+            meals: hotel.meals || [],
+            drinks: hotel.drinks || [],
+            whats_new: hotel.whats_new || '',
+            created_at: hotel.created_at || new Date().toISOString(),
+            updated_at: hotel.updated_at || new Date().toISOString()
+        };
+
+        const visible = await isHotelVisible(hotelId);
+        const featured = await isHotelFeatured(hotelId);
+        const daysLeft = safeHotel.subscription_expiry ?
+            Math.max(0, Math.ceil((new Date(safeHotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
             0;
 
+        // Get bookings
         const roomBookings = await pool.query(
             `SELECT rb.*, r.room_type_name 
              FROM room_bookings rb
-             JOIN rooms r ON rb.room_type_id = r.id
+             LEFT JOIN rooms r ON rb.room_type_id = r.id
              WHERE rb.hotel_id = $1 AND rb.status = 'confirmed'
              ORDER BY rb.check_in_date DESC`,
             [hotelId]
@@ -392,25 +438,7 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
         );
 
         res.json({
-            id: hotel.id,
-            user_id: hotel.user_id,
-            hotel_name: hotel.hotel_name || '',
-            phone: hotel.phone || '',
-            address: hotel.address || '',
-            city: hotel.city || '',
-            country: hotel.country || '',
-            star_rating: hotel.star_rating || 3,
-            description: hotel.description || '',
-            photos: hotel.photos || [],
-            is_active: hotel.is_active !== undefined ? hotel.is_active : true,
-            subscription_expiry: hotel.subscription_expiry || null,
-            is_featured: hotel.is_featured || false,
-            featured_expiry: hotel.featured_expiry || null,
-            meals: hotel.meals || [],
-            drinks: hotel.drinks || [],
-            whats_new: hotel.whats_new || '',
-            created_at: hotel.created_at,
-            updated_at: hotel.updated_at,
+            ...safeHotel,
             is_visible: visible,
             is_featured_active: featured,
             subscription_days_left: daysLeft,
@@ -763,7 +791,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
 });
 
 // ======================================================
-// ===== MY BOOKINGS (COMPLETE FIX) =====
+// ===== MY BOOKINGS =====
 // ======================================================
 app.get('/api/my-bookings', async (req, res) => {
     try {
@@ -775,7 +803,6 @@ app.get('/api/my-bookings', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
 
-        // UNLOCKED HOTELS
         const unlocked = await pool.query(
             `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
              FROM payments p
@@ -785,7 +812,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // ROOM BOOKINGS - with all columns using COALESCE
         const roomBookings = await pool.query(
             `SELECT 
                 rb.id,
@@ -811,7 +837,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // FOOD ORDERS - with all columns using COALESCE
         const foodOrders = await pool.query(
             `SELECT 
                 fo.id,
@@ -842,13 +867,7 @@ app.get('/api/my-bookings', async (req, res) => {
         });
     } catch (error) {
         console.error('My bookings error:', error);
-        // Always return valid JSON
-        res.json({
-            unlocked_hotels: [],
-            room_bookings: [],
-            food_orders: [],
-            error: error.message
-        });
+        res.json({ unlocked_hotels: [], room_bookings: [], food_orders: [] });
     }
 });
 
@@ -1054,4 +1073,5 @@ app.get('/api/reviews/public', async (req, res) => {
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`👤 Admin: admin@hotelbooking.com / admin123`);
+    console.log(`🔍 Debug: /api/debug/hotel/:id`);
 });
