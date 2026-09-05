@@ -881,7 +881,7 @@ app.post('/api/food-orders', async (req, res) => {
     }
 });
 
-// ===== WALK-IN FOOD ORDER =====
+// ===== WALK-IN FOOD ORDER (FIXED) =====
 app.post('/api/food-orders/walk-in', isHotelOwner, async (req, res) => {
     try {
         const { hotel_id, items, pickup_date, pickup_time, client_name, client_phone, special_instructions } = req.body;
@@ -896,9 +896,12 @@ app.post('/api/food-orders/walk-in', isHotelOwner, async (req, res) => {
              RETURNING *`,
             [hotel_id, client_name, client_phone, JSON.stringify(items), total, pickup_date, pickup_time, special_instructions || '', bookingRef]
         );
+        
+        // ✅ FIXED: Return proper JSON with the result
         res.status(201).json(result.rows[0]);
     } catch (error) {
         console.error('Walk-in food order error:', error);
+        // ✅ FIXED: Return proper JSON error
         res.status(500).json({ error: 'Failed to place order: ' + error.message });
     }
 });
