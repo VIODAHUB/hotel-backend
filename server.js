@@ -179,7 +179,7 @@ app.get('/api/debug/hotel/:id', isHotelOwner, async (req, res) => {
             [hotelId, req.userId]
         );
         if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Hotel not found' });
+            return res.status(404).json({ error: 'Hotel not found or not owned by you' });
         }
         res.json({
             hotel: result.rows[0],
@@ -369,7 +369,7 @@ app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== GET SINGLE HOTEL DETAILS (FULLY SAFE) =====
+// ===== GET SINGLE HOTEL DETAILS (SAFE) =====
 app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.id);
     try {
@@ -382,10 +382,10 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
         }
         const hotel = result.rows[0];
 
-        // Safely get all values with fallbacks
+        // Build safe hotel object
         const safeHotel = {
-            id: hotel.id || 0,
-            user_id: hotel.user_id || 0,
+            id: hotel.id,
+            user_id: hotel.user_id,
             hotel_name: hotel.hotel_name || 'Unnamed Hotel',
             phone: hotel.phone || '',
             address: hotel.address || '',
@@ -411,7 +411,6 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             Math.max(0, Math.ceil((new Date(safeHotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
             0;
 
-        // Get bookings
         const roomBookings = await pool.query(
             `SELECT rb.*, r.room_type_name 
              FROM room_bookings rb
