@@ -170,30 +170,33 @@ const isHotelFeatured = async (hotelId) => {
     return expiry > new Date();
 };
 
-// ===== GET ROOM AVAILABILITY HELPER =====
-async function getRoomAvailability(hotelId) {
-    // Get all rooms for this hotel
+// ===== GET ROOM AVAILABILITY FOR SPECIFIC DATES =====
+async function getRoomAvailability(hotelId, checkInDate, checkOutDate) {
+    // If no dates provided, show all rooms with their total counts
     const roomsResult = await pool.query(
         'SELECT * FROM rooms WHERE hotel_id = $1',
         [hotelId]
     );
     
-    // Get all confirmed bookings with future dates
-    const bookingsResult = await pool.query(
-        `SELECT room_type_id, COUNT(*) as booked_count 
-         FROM room_bookings 
-         WHERE hotel_id = $1 
-           AND status = 'confirmed' 
-           AND check_out_date >= CURRENT_DATE
-         GROUP BY room_type_id`,
-        [hotelId]
-    );
-    
-    // Create a map of booked counts per room type
-    const bookedMap = {};
-    bookingsResult.rows.forEach(b => {
-        bookedMap[b.room_type_id] = parseInt(b.booked_count);
-    });
+    // If we have specific dates, check bookings that overlap
+    let bookedMap = {};
+    if (checkInDate && checkOutDate) {
+        // Count bookings that overlap with the requested period
+        const bookingsResult = await pool.query(
+            `SELECT room_type_id, COUNT(*) as booked_count 
+             FROM room_bookings 
+             WHERE hotel_id = $1 
+               AND status = 'confirmed'
+               AND check_in_date < $2 
+               AND check_out_date > $3
+             GROUP BY room_type_id`,
+            [hotelId, checkOutDate, checkInDate]
+        );
+        
+        bookingsResult.rows.forEach(b => {
+            bookedMap[b.room_type_id] = parseInt(b.booked_count);
+        });
+    }
     
     // Calculate available rooms for each room type
     return roomsResult.rows.map(room => {
@@ -446,37 +449,20 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
-        // Get room stats with availability
-        const roomsResult = await pool.query(
-            'SELECT id, total_rooms, is_available FROM rooms WHERE hotel_id = $1',
-            [hotelId]
-        );
+        // Get room stats with date-specific availability (using today's date)
+        const today = new Date().toISOString().split('T')[0];
+        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const roomsWithAvailability = await getRoomAvailability(hotelId, today, tomorrow);
         
-        const bookedStats = await pool.query(
-            `SELECT room_type_id, COUNT(*) as booked_count 
-             FROM room_bookings 
-             WHERE hotel_id = $1 
-               AND status = 'confirmed' 
-               AND check_out_date >= CURRENT_DATE
-             GROUP BY room_type_id`,
-            [hotelId]
-        );
-        
-        const bookedMap = {};
-        bookedStats.rows.forEach(b => {
-            bookedMap[b.room_type_id] = parseInt(b.booked_count);
-        });
-
         let totalRooms = 0;
         let totalAvailable = 0;
         let totalRoomTypes = 0;
         
-        roomsResult.rows.forEach(room => {
+        roomsWithAvailability.forEach(room => {
             totalRooms += room.total_rooms || 0;
             totalRoomTypes++;
             if (room.is_available) {
-                const booked = bookedMap[room.id] || 0;
-                totalAvailable += Math.max(0, (room.total_rooms || 0) - booked);
+                totalAvailable += room.available_rooms || 0;
             }
         });
 
@@ -577,11 +563,22 @@ app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== GET ROOMS WITH AVAILABILITY (OWNER) =====
+// ===== GET ROOMS WITH DATE-SPECIFIC AVAILABILITY =====
 app.get('/api/rooms/hotel/:hotelId/availability', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
+    const { check_in, check_out } = req.query;
+    
     try {
-        const roomsWithAvailability = await getRoomAvailability(hotelId);
+        let roomsWithAvailability;
+        if (check_in && check_out) {
+            // Use the provided dates
+            roomsWithAvailability = await getRoomAvailability(hotelId, check_in, check_out);
+        } else {
+            // Default to today and tomorrow
+            const today = new Date().toISOString().split('T')[0];
+            const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+            roomsWithAvailability = await getRoomAvailability(hotelId, today, tomorrow);
+        }
         res.json(roomsWithAvailability);
     } catch (error) {
         console.error('Error fetching room availability:', error);
@@ -709,42 +706,23 @@ app.get('/api/hotels/:id', async (req, res) => {
             } catch (e) { /* ignore */ }
         }
 
-        // Get rooms with availability for public view
-        const roomsResult = await pool.query(
-            'SELECT * FROM rooms WHERE hotel_id = $1 AND is_available = TRUE',
-            [id]
-        );
+        // Get rooms with availability for today
+        const today = new Date().toISOString().split('T')[0];
+        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const roomsWithAvailability = await getRoomAvailability(id, today, tomorrow);
         
-        const bookingsResult = await pool.query(
-            `SELECT room_type_id, COUNT(*) as booked_count 
-             FROM room_bookings 
-             WHERE hotel_id = $1 
-               AND status = 'confirmed' 
-               AND check_out_date >= CURRENT_DATE
-             GROUP BY room_type_id`,
-            [id]
-        );
-        
-        const bookedMap = {};
-        bookingsResult.rows.forEach(b => {
-            bookedMap[b.room_type_id] = parseInt(b.booked_count);
-        });
-
-        const rooms = roomsResult.rows.map(r => {
-            const booked = bookedMap[r.id] || 0;
-            const total = r.total_rooms || 0;
-            const available = Math.max(0, total - booked);
-            return {
+        const rooms = roomsWithAvailability
+            .filter(r => r.is_available === true)
+            .map(r => ({
                 id: r.id,
                 name: r.room_type_name,
                 capacity: r.capacity,
                 price_per_night: hasAccess ? r.base_price_per_night : null,
-                total_rooms: total,
-                booked_count: booked,
-                available_rooms: available,
-                is_available: r.is_available && available > 0
-            };
-        });
+                total_rooms: r.total_rooms,
+                booked_count: r.booked_count,
+                available_rooms: r.available_rooms,
+                is_available: r.is_available && r.available_rooms > 0
+            }));
 
         const confs = await pool.query('SELECT * FROM conference_rooms WHERE hotel_id = $1', [id]);
         const reviews = await pool.query(
@@ -1055,7 +1033,7 @@ app.get('/api/food-orders/:id', async (req, res) => {
     }
 });
 
-// ===== ROOM BOOKINGS (WITH AVAILABILITY CHECK) =====
+// ===== ROOM BOOKINGS (WITH DATE-SPECIFIC AVAILABILITY CHECK) =====
 app.post('/api/room-bookings', async (req, res) => {
     try {
         const { room_type_id, check_in_date, check_out_date, number_of_guests, special_requests } = req.body;
@@ -1075,7 +1053,7 @@ app.post('/api/room-bookings', async (req, res) => {
             return res.status(404).json({ error: 'Room not found' });
         }
 
-        // Check availability
+        // Check availability for the specific dates
         const bookingCheck = await pool.query(
             `SELECT COUNT(*) as booked_count 
              FROM room_bookings 
@@ -1124,7 +1102,7 @@ app.post('/api/room-bookings/walk-in', isHotelOwner, async (req, res) => {
             return res.status(404).json({ error: 'Room not found' });
         }
 
-        // Check availability
+        // Check availability for the specific dates
         const bookingCheck = await pool.query(
             `SELECT COUNT(*) as booked_count 
              FROM room_bookings 
