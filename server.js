@@ -1054,7 +1054,320 @@ app.get('/api/reviews/public', async (req, res) => {
         res.status(500).json({ error: 'Server error' });
     }
 });
+// ===== ROOM MANAGEMENT =====
+app.post('/api/rooms', isHotelOwner, async (req, res) => {
+    const { hotel_id, room_type_name, capacity, base_price_per_night, total_rooms, is_available } = req.body;
+    
+    // Validate required fields
+    if (!hotel_id || !room_type_name || !capacity || !base_price_per_night) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
 
+    try {
+        // Verify hotel belongs to this owner
+        const hotelCheck = await pool.query(
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotel_id, req.userId]
+        );
+        if (hotelCheck.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this hotel' });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO rooms (hotel_id, room_type_name, capacity, base_price_per_night, total_rooms, is_available)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING *`,
+            [hotel_id, room_type_name, capacity, base_price_per_night, total_rooms || 1, is_available !== undefined ? is_available : true]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error('Create room error:', error);
+        res.status(500).json({ error: 'Failed to create room: ' + error.message });
+    }
+});
+
+app.get('/api/rooms', isHotelOwner, async (req, res) => {
+    try {
+        // Get all rooms for hotels owned by this user
+        const result = await pool.query(
+            `SELECT r.*, h.hotel_name 
+             FROM rooms r
+             JOIN hotels h ON r.hotel_id = h.id
+             WHERE h.user_id = $1
+             ORDER BY h.hotel_name, r.room_type_name`,
+            [req.userId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get rooms error:', error);
+        res.status(500).json({ error: 'Failed to fetch rooms' });
+    }
+});
+
+app.get('/api/rooms/hotel/:hotelId', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    try {
+        const result = await pool.query(
+            'SELECT * FROM rooms WHERE hotel_id = $1 ORDER BY room_type_name',
+            [hotelId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get hotel rooms error:', error);
+        res.status(500).json({ error: 'Failed to fetch rooms' });
+    }
+});
+
+app.put('/api/rooms/:id', isHotelOwner, async (req, res) => {
+    const roomId = parseInt(req.params.id);
+    const { room_type_name, capacity, base_price_per_night, total_rooms, is_available } = req.body;
+    
+    try {
+        // Verify room belongs to a hotel owned by this user
+        const check = await pool.query(
+            `SELECT r.id FROM rooms r
+             JOIN hotels h ON r.hotel_id = h.id
+             WHERE r.id = $1 AND h.user_id = $2`,
+            [roomId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this room' });
+        }
+
+        const result = await pool.query(
+            `UPDATE rooms SET
+                room_type_name = COALESCE($1, room_type_name),
+                capacity = COALESCE($2, capacity),
+                base_price_per_night = COALESCE($3, base_price_per_night),
+                total_rooms = COALESCE($4, total_rooms),
+                is_available = COALESCE($5, is_available)
+             WHERE id = $6
+             RETURNING *`,
+            [room_type_name, capacity, base_price_per_night, total_rooms, is_available, roomId]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Update room error:', error);
+        res.status(500).json({ error: 'Failed to update room' });
+    }
+});
+
+app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
+    const roomId = parseInt(req.params.id);
+    try {
+        // Verify room belongs to a hotel owned by this user
+        const check = await pool.query(
+            `SELECT r.id FROM rooms r
+             JOIN hotels h ON r.hotel_id = h.id
+             WHERE r.id = $1 AND h.user_id = $2`,
+            [roomId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this room' });
+        }
+
+        await pool.query('DELETE FROM rooms WHERE id = $1', [roomId]);
+        res.json({ message: 'Room deleted successfully' });
+    } catch (error) {
+        console.error('Delete room error:', error);
+        res.status(500).json({ error: 'Failed to delete room' });
+    }
+});
+
+// ===== CONFERENCE ROOM MANAGEMENT =====
+app.post('/api/conference-rooms', isHotelOwner, async (req, res) => {
+    const { hotel_id, room_name, capacity, price_per_hour, amenities } = req.body;
+    
+    if (!hotel_id || !room_name || !capacity || !price_per_hour) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    try {
+        const hotelCheck = await pool.query(
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotel_id, req.userId]
+        );
+        if (hotelCheck.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this hotel' });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO conference_rooms (hotel_id, room_name, capacity, price_per_hour, amenities)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING *`,
+            [hotel_id, room_name, capacity, price_per_hour, amenities || []]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error('Create conference room error:', error);
+        res.status(500).json({ error: 'Failed to create conference room' });
+    }
+});
+
+app.get('/api/conference-rooms/hotel/:hotelId', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    try {
+        const result = await pool.query(
+            'SELECT * FROM conference_rooms WHERE hotel_id = $1 ORDER BY room_name',
+            [hotelId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get conference rooms error:', error);
+        res.status(500).json({ error: 'Failed to fetch conference rooms' });
+    }
+});
+
+app.put('/api/conference-rooms/:id', isHotelOwner, async (req, res) => {
+    const roomId = parseInt(req.params.id);
+    const { room_name, capacity, price_per_hour, amenities } = req.body;
+    
+    try {
+        const check = await pool.query(
+            `SELECT c.id FROM conference_rooms c
+             JOIN hotels h ON c.hotel_id = h.id
+             WHERE c.id = $1 AND h.user_id = $2`,
+            [roomId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this conference room' });
+        }
+
+        const result = await pool.query(
+            `UPDATE conference_rooms SET
+                room_name = COALESCE($1, room_name),
+                capacity = COALESCE($2, capacity),
+                price_per_hour = COALESCE($3, price_per_hour),
+                amenities = COALESCE($4, amenities)
+             WHERE id = $5
+             RETURNING *`,
+            [room_name, capacity, price_per_hour, amenities, roomId]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Update conference room error:', error);
+        res.status(500).json({ error: 'Failed to update conference room' });
+    }
+});
+
+app.delete('/api/conference-rooms/:id', isHotelOwner, async (req, res) => {
+    const roomId = parseInt(req.params.id);
+    try {
+        const check = await pool.query(
+            `SELECT c.id FROM conference_rooms c
+             JOIN hotels h ON c.hotel_id = h.id
+             WHERE c.id = $1 AND h.user_id = $2`,
+            [roomId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this conference room' });
+        }
+
+        await pool.query('DELETE FROM conference_rooms WHERE id = $1', [roomId]);
+        res.json({ message: 'Conference room deleted successfully' });
+    } catch (error) {
+        console.error('Delete conference room error:', error);
+        res.status(500).json({ error: 'Failed to delete conference room' });
+    }
+});
+
+// ===== HOTEL MENU MANAGEMENT =====
+app.post('/api/menu-items', isHotelOwner, async (req, res) => {
+    const { hotel_id, item_name, description, price, category, is_available } = req.body;
+    
+    if (!hotel_id || !item_name || !price) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    try {
+        const hotelCheck = await pool.query(
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotel_id, req.userId]
+        );
+        if (hotelCheck.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this hotel' });
+        }
+
+        const result = await pool.query(
+            `INSERT INTO hotel_menu (hotel_id, item_name, description, price, category, is_available)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING *`,
+            [hotel_id, item_name, description || '', price, category || 'Main Course', is_available !== undefined ? is_available : true]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error('Create menu item error:', error);
+        res.status(500).json({ error: 'Failed to create menu item' });
+    }
+});
+
+app.get('/api/menu-items/hotel/:hotelId', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    try {
+        const result = await pool.query(
+            'SELECT * FROM hotel_menu WHERE hotel_id = $1 ORDER BY category, item_name',
+            [hotelId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Get menu items error:', error);
+        res.status(500).json({ error: 'Failed to fetch menu items' });
+    }
+});
+
+app.put('/api/menu-items/:id', isHotelOwner, async (req, res) => {
+    const itemId = parseInt(req.params.id);
+    const { item_name, description, price, category, is_available } = req.body;
+    
+    try {
+        const check = await pool.query(
+            `SELECT m.id FROM hotel_menu m
+             JOIN hotels h ON m.hotel_id = h.id
+             WHERE m.id = $1 AND h.user_id = $2`,
+            [itemId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this menu item' });
+        }
+
+        const result = await pool.query(
+            `UPDATE hotel_menu SET
+                item_name = COALESCE($1, item_name),
+                description = COALESCE($2, description),
+                price = COALESCE($3, price),
+                category = COALESCE($4, category),
+                is_available = COALESCE($5, is_available)
+             WHERE id = $6
+             RETURNING *`,
+            [item_name, description, price, category, is_available, itemId]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Update menu item error:', error);
+        res.status(500).json({ error: 'Failed to update menu item' });
+    }
+});
+
+app.delete('/api/menu-items/:id', isHotelOwner, async (req, res) => {
+    const itemId = parseInt(req.params.id);
+    try {
+        const check = await pool.query(
+            `SELECT m.id FROM hotel_menu m
+             JOIN hotels h ON m.hotel_id = h.id
+             WHERE m.id = $1 AND h.user_id = $2`,
+            [itemId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this menu item' });
+        }
+
+        await pool.query('DELETE FROM hotel_menu WHERE id = $1', [itemId]);
+        res.json({ message: 'Menu item deleted successfully' });
+    } catch (error) {
+        console.error('Delete menu item error:', error);
+        res.status(500).json({ error: 'Failed to delete menu item' });
+    }
+});
 // ===== START SERVER =====
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
