@@ -76,16 +76,13 @@ app.post('/api/auth/login', async (req, res) => {
 app.post('/api/auth/register', async (req, res) => {
     const { email, password, userType, companyName, fullName, phone } = req.body;
     try {
-        // Check if user exists
         const exists = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
         if (exists.rows.length > 0) {
             return res.status(400).json({ error: 'Email already registered' });
         }
 
-        // Hash password
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        // Insert user
         const result = await pool.query(
             `INSERT INTO users (email, password_hash, user_type, company_name, full_name, phone, is_verified)
              VALUES ($1, $2, $3, $4, $5, $6, TRUE)
@@ -144,6 +141,34 @@ const isHotelOwner = async (req, res, next) => {
     } catch {
         res.status(401).json({ error: 'Invalid token' });
     }
+};
+
+// ===== HELPER FUNCTIONS (FIXED) =====
+const isHotelVisible = async (hotelId) => {
+    const result = await pool.query(
+        'SELECT is_active, subscription_expiry FROM hotels WHERE id = $1',
+        [hotelId]
+    );
+    if (result.rows.length === 0) return false;
+    const hotel = result.rows[0];
+    if (!hotel.is_active) return false;
+    if (!hotel.subscription_expiry) return false;
+    // Safe date comparison
+    const expiry = new Date(hotel.subscription_expiry);
+    return expiry > new Date();
+};
+
+const isHotelFeatured = async (hotelId) => {
+    const result = await pool.query(
+        'SELECT is_featured, featured_expiry FROM hotels WHERE id = $1',
+        [hotelId]
+    );
+    if (result.rows.length === 0) return false;
+    const hotel = result.rows[0];
+    if (!hotel.is_featured) return false;
+    if (!hotel.featured_expiry) return false;
+    const expiry = new Date(hotel.featured_expiry);
+    return expiry > new Date();
 };
 
 // ===== ADMIN ROUTES =====
@@ -298,25 +323,7 @@ app.get('/api/admin/users', isAdmin, async (req, res) => {
     }
 });
 
-// ===== HOTEL OWNER ROUTES (simplified) =====
-const isHotelVisible = async (hotelId) => {
-    const result = await pool.query('SELECT is_active, subscription_expiry FROM hotels WHERE id = $1', [hotelId]);
-    if (result.rows.length === 0) return false;
-    const hotel = result.rows[0];
-    if (!hotel.is_active) return false;
-    if (!hotel.subscription_expiry) return false;
-    return new Date(hotel.subscription_expiry) > new Date();
-};
-
-const isHotelFeatured = async (hotelId) => {
-    const result = await pool.query('SELECT is_featured, featured_expiry FROM hotels WHERE id = $1', [hotelId]);
-    if (result.rows.length === 0) return false;
-    const hotel = result.rows[0];
-    if (!hotel.is_featured) return false;
-    if (!hotel.featured_expiry) return false;
-    return new Date(hotel.featured_expiry) > new Date();
-};
-
+// ===== HOTEL OWNER ROUTES =====
 app.get('/api/hotels/me', isHotelOwner, async (req, res) => {
     const result = await pool.query('SELECT * FROM hotels WHERE user_id = $1', [req.userId]);
     if (result.rows.length === 0) {
@@ -334,6 +341,55 @@ app.get('/api/hotels/me', isHotelOwner, async (req, res) => {
         is_featured_active: featured,
         subscription_days_left: daysLeft
     });
+});
+
+app.put('/api/hotels/me', isHotelOwner, async (req, res) => {
+    const hotelId = req.hotel?.id || (await pool.query('SELECT id FROM hotels WHERE user_id = $1', [req.userId])).rows[0]?.id;
+    if (!hotelId) {
+        return res.status(404).json({ error: 'No hotel found' });
+    }
+    const { hotelName, phone, city, country, address, description, starRating, meals, drinks, whats_new } = req.body;
+    try {
+        const result = await pool.query(
+            `UPDATE hotels SET
+                hotel_name = COALESCE($1, hotel_name),
+                phone = COALESCE($2, phone),
+                city = COALESCE($3, city),
+                country = COALESCE($4, country),
+                address = COALESCE($5, address),
+                description = COALESCE($6, description),
+                star_rating = COALESCE($7, star_rating),
+                meals = COALESCE($8, meals),
+                drinks = COALESCE($9, drinks),
+                whats_new = COALESCE($10, whats_new),
+                updated_at = CURRENT_TIMESTAMP
+             WHERE id = $11
+             RETURNING *`,
+            [hotelName, phone, city, country, address, description, starRating, meals, drinks, whats_new, hotelId]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Update failed' });
+    }
+});
+
+app.post('/api/hotels/me/photos', isHotelOwner, async (req, res) => {
+    const hotelId = req.hotel?.id || (await pool.query('SELECT id FROM hotels WHERE user_id = $1', [req.userId])).rows[0]?.id;
+    if (!hotelId) {
+        return res.status(404).json({ error: 'No hotel found' });
+    }
+    const { photos } = req.body;
+    if (photos && photos.length > 5) {
+        return res.status(400).json({ error: 'Maximum 5 photos allowed' });
+    }
+    try {
+        await pool.query('UPDATE hotels SET photos = $1 WHERE id = $2', [photos || [], hotelId]);
+        res.json({ message: 'Photos updated', photos: photos || [] });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Update failed' });
+    }
 });
 
 // ===== PUBLIC ROUTES =====
@@ -381,6 +437,42 @@ app.get('/api/hotels/public', async (req, res) => {
             whats_new: h.whats_new || ''
         }));
         res.json(publicList);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+app.get('/api/hotels/featured', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT h.*,
+                   (SELECT json_agg(json_build_object(
+                        'id', r.id,
+                        'name', r.room_type_name,
+                        'capacity', r.capacity,
+                        'price_per_night', r.base_price_per_night,
+                        'total_rooms', r.total_rooms,
+                        'is_available', r.is_available
+                   )) FROM rooms r WHERE r.hotel_id = h.id AND r.is_available = TRUE) as room_types
+            FROM hotels h
+            WHERE h.is_featured = TRUE AND h.featured_expiry > NOW() AND h.is_active = TRUE AND (h.subscription_expiry IS NOT NULL AND h.subscription_expiry > NOW())
+            ORDER BY h.created_at DESC
+        `);
+        const featured = result.rows.map(h => ({
+            id: h.id,
+            hotel_name: h.hotel_name,
+            city: h.city,
+            country: h.country,
+            star_rating: h.star_rating,
+            description: h.description,
+            photos: h.photos || [],
+            room_types: h.room_types || [],
+            meals: h.meals || [],
+            drinks: h.drinks || [],
+            whats_new: h.whats_new || ''
+        }));
+        res.json(featured);
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Server error' });
@@ -480,7 +572,7 @@ app.get('/api/hotels/:id', async (req, res) => {
     }
 });
 
-// ===== PAYMENTS (Client Unlock) =====
+// ===== PAYMENTS =====
 const UNLOCK_PRICE = 100;
 const UNLOCK_EXPIRY_DAYS = 7;
 
@@ -564,7 +656,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ===== MY BOOKINGS - SIMPLIFIED =====
+// ===== MY BOOKINGS =====
 app.get('/api/my-bookings', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
@@ -575,7 +667,6 @@ app.get('/api/my-bookings', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
 
-        // Get unlocked hotels
         const unlocked = await pool.query(
             `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
              FROM payments p
@@ -585,7 +676,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Get room bookings
         const roomBookings = await pool.query(
             `SELECT rb.*, r.room_type_name, h.hotel_name 
              FROM room_bookings rb
@@ -596,7 +686,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Get food orders
         const foodOrders = await pool.query(
             `SELECT fo.*, h.hotel_name 
              FROM food_orders fo
