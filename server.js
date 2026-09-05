@@ -745,7 +745,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
 });
 
 // ======================================================
-// ===== MY BOOKINGS (FIXED - handles missing columns) =====
+// ===== MY BOOKINGS - COMPLETELY SAFE VERSION =====
 // ======================================================
 app.get('/api/my-bookings', async (req, res) => {
     try {
@@ -757,7 +757,7 @@ app.get('/api/my-bookings', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
 
-        // Get unlocked hotels
+        // ----- UNLOCKED HOTELS -----
         const unlocked = await pool.query(
             `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
              FROM payments p
@@ -767,7 +767,7 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Get room bookings - using COALESCE for safety
+        // ----- ROOM BOOKINGS (safe) -----
         const roomBookings = await pool.query(
             `SELECT 
                 rb.id,
@@ -783,7 +783,8 @@ app.get('/api/my-bookings', async (req, res) => {
                 COALESCE(rb.client_phone, 'N/A') as client_phone,
                 COALESCE(rb.booking_reference, 'N/A') as booking_reference,
                 COALESCE(r.room_type_name, 'Unknown') as room_type_name,
-                COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
+                COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name,
+                rb.created_at
              FROM room_bookings rb
              LEFT JOIN rooms r ON rb.room_type_id = r.id
              LEFT JOIN hotels h ON rb.hotel_id = h.id
@@ -792,7 +793,7 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Get food orders - using COALESCE for safety
+        // ----- FOOD ORDERS (safe) -----
         const foodOrders = await pool.query(
             `SELECT 
                 fo.id,
@@ -807,7 +808,8 @@ app.get('/api/my-bookings', async (req, res) => {
                 COALESCE(fo.client_name, 'N/A') as client_name,
                 COALESCE(fo.client_phone, 'N/A') as client_phone,
                 COALESCE(fo.booking_reference, 'N/A') as booking_reference,
-                COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
+                COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name,
+                fo.created_at
              FROM food_orders fo
              LEFT JOIN hotels h ON fo.hotel_id = h.id
              WHERE fo.client_id = $1 AND fo.status = 'confirmed'
@@ -821,8 +823,14 @@ app.get('/api/my-bookings', async (req, res) => {
             food_orders: foodOrders.rows || []
         });
     } catch (error) {
-        console.error('My bookings error:', error);
-        res.json({ unlocked_hotels: [], room_bookings: [], food_orders: [] });
+        console.error('❌ My bookings error:', error);
+        // Always return valid JSON, never throw an error
+        res.json({
+            unlocked_hotels: [],
+            room_bookings: [],
+            food_orders: [],
+            error: error.message
+        });
     }
 });
 
