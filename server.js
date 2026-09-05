@@ -74,7 +74,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.post('/api/auth/register', async (req, res) => {
-    const { email, password, userType, companyName, fullName, phone } = req.body;
+    const { email, password, userType, companyName, fullName } = req.body;
     try {
         const exists = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
         if (exists.rows.length > 0) {
@@ -84,10 +84,10 @@ app.post('/api/auth/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, 10);
 
         const result = await pool.query(
-            `INSERT INTO users (email, password_hash, user_type, company_name, full_name, phone, is_verified)
-             VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+            `INSERT INTO users (email, password_hash, user_type, company_name, full_name, is_verified)
+             VALUES ($1, $2, $3, $4, $5, TRUE)
              RETURNING id, email, user_type, full_name`,
-            [email, hashedPassword, userType, companyName || null, fullName || null, phone || null]
+            [email, hashedPassword, userType, companyName || null, fullName || null]
         );
 
         const user = result.rows[0];
@@ -143,7 +143,7 @@ const isHotelOwner = async (req, res, next) => {
     }
 };
 
-// ===== HELPER FUNCTIONS (FIXED) =====
+// ===== HELPER FUNCTIONS =====
 const isHotelVisible = async (hotelId) => {
     const result = await pool.query(
         'SELECT is_active, subscription_expiry FROM hotels WHERE id = $1',
@@ -153,7 +153,6 @@ const isHotelVisible = async (hotelId) => {
     const hotel = result.rows[0];
     if (!hotel.is_active) return false;
     if (!hotel.subscription_expiry) return false;
-    // Safe date comparison
     const expiry = new Date(hotel.subscription_expiry);
     return expiry > new Date();
 };
@@ -656,7 +655,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ===== MY BOOKINGS =====
+// ===== MY BOOKINGS (FIXED) =====
 app.get('/api/my-bookings', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
@@ -667,6 +666,7 @@ app.get('/api/my-bookings', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
 
+        // Get unlocked hotels
         const unlocked = await pool.query(
             `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
              FROM payments p
@@ -676,6 +676,7 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
+        // Get room bookings
         const roomBookings = await pool.query(
             `SELECT rb.*, r.room_type_name, h.hotel_name 
              FROM room_bookings rb
@@ -686,6 +687,7 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
+        // Get food orders
         const foodOrders = await pool.query(
             `SELECT fo.*, h.hotel_name 
              FROM food_orders fo
@@ -703,6 +705,77 @@ app.get('/api/my-bookings', async (req, res) => {
     } catch (error) {
         console.error('My bookings error:', error);
         res.json({ unlocked_hotels: [], room_bookings: [], food_orders: [] });
+    }
+});
+
+// ======================================================
+// ===== FOOD ORDERS (FIXED - no middleware) =====
+// ======================================================
+app.post('/api/food-orders', async (req, res) => {
+    try {
+        const { hotel_id, items, pickup_date, pickup_time, special_instructions } = req.body;
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ error: 'Please login first' });
+        }
+
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+        const clientId = decoded.id;
+
+        let total = 0;
+        items.forEach(item => total += item.price * item.quantity);
+        const bookingRef = 'FOOD-' + Date.now().toString().slice(-8);
+
+        const result = await pool.query(
+            `INSERT INTO food_orders (client_id, hotel_id, items, total_amount, pickup_date, pickup_time, special_instructions, payment_status, booking_reference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+             RETURNING *`,
+            [clientId, hotel_id, JSON.stringify(items), total, pickup_date, pickup_time, special_instructions || '', bookingRef]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error('Food order error:', error);
+        res.status(500).json({ error: 'Failed to place order: ' + error.message });
+    }
+});
+
+// ======================================================
+// ===== ROOM BOOKINGS (FIXED - no middleware) =====
+// ======================================================
+app.post('/api/room-bookings', async (req, res) => {
+    try {
+        const { room_type_id, check_in_date, check_out_date, number_of_guests, special_requests } = req.body;
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ error: 'Please login first' });
+        }
+
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+        const clientId = decoded.id;
+
+        const room = await pool.query(
+            'SELECT r.*, h.id as hotel_id FROM rooms r JOIN hotels h ON r.hotel_id = h.id WHERE r.id = $1 AND r.is_available = TRUE',
+            [room_type_id]
+        );
+        if (room.rows.length === 0) {
+            return res.status(404).json({ error: 'Room not found or unavailable' });
+        }
+
+        const days = Math.ceil((new Date(check_out_date) - new Date(check_in_date)) / (1000 * 60 * 60 * 24));
+        const total = room.rows[0].base_price_per_night * days;
+        const bookingRef = 'ROOM-' + Date.now().toString().slice(-8);
+
+        const result = await pool.query(
+            `INSERT INTO room_bookings (client_id, hotel_id, room_type_id, check_in_date, check_out_date, 
+                number_of_guests, total_amount, special_requests, payment_status, booking_reference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)
+             RETURNING *`,
+            [clientId, room.rows[0].hotel_id, room_type_id, check_in_date, check_out_date, number_of_guests || 1, total, special_requests || '', bookingRef]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error('Room booking error:', error);
+        res.status(500).json({ error: 'Failed to book room: ' + error.message });
     }
 });
 
