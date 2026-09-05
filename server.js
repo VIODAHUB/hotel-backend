@@ -53,10 +53,15 @@ app.post('/api/auth/login', async (req, res) => {
         if (!valid) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
+        // No session tracking - allow multiple devices
         const token = jwt.sign(
-            { id: user.id, userType: user.user_type },
+            { 
+                id: user.id, 
+                userType: user.user_type,
+                email: user.email 
+            },
             process.env.JWT_SECRET || 'secret',
-            { expiresIn: '7d' }
+            { expiresIn: '30d' } // Extended expiry for multi-device
         );
         res.json({
             token,
@@ -92,9 +97,13 @@ app.post('/api/auth/register', async (req, res) => {
 
         const user = result.rows[0];
         const token = jwt.sign(
-            { id: user.id, userType: user.user_type },
+            { 
+                id: user.id, 
+                userType: user.user_type,
+                email: user.email 
+            },
             process.env.JWT_SECRET || 'secret',
-            { expiresIn: '7d' }
+            { expiresIn: '30d' }
         );
 
         res.json({
@@ -172,16 +181,13 @@ const isHotelFeatured = async (hotelId) => {
 
 // ===== GET ROOM AVAILABILITY FOR SPECIFIC DATES =====
 async function getRoomAvailability(hotelId, checkInDate, checkOutDate) {
-    // If no dates provided, show all rooms with their total counts
     const roomsResult = await pool.query(
         'SELECT * FROM rooms WHERE hotel_id = $1',
         [hotelId]
     );
     
-    // If we have specific dates, check bookings that overlap
     let bookedMap = {};
     if (checkInDate && checkOutDate) {
-        // Count bookings that overlap with the requested period
         const bookingsResult = await pool.query(
             `SELECT room_type_id, COUNT(*) as booked_count 
              FROM room_bookings 
@@ -198,7 +204,6 @@ async function getRoomAvailability(hotelId, checkInDate, checkOutDate) {
         });
     }
     
-    // Calculate available rooms for each room type
     return roomsResult.rows.map(room => {
         const booked = bookedMap[room.id] || 0;
         const total = room.total_rooms || 0;
@@ -210,6 +215,79 @@ async function getRoomAvailability(hotelId, checkInDate, checkOutDate) {
             total_rooms: total
         };
     });
+}
+
+// ===== GET DATE-SPECIFIC STATISTICS =====
+async function getDateSpecificStats(hotelId, date) {
+    const targetDate = date || new Date().toISOString().split('T')[0];
+    const nextDay = new Date(new Date(targetDate).getTime() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    
+    // Get all rooms
+    const roomsResult = await pool.query(
+        'SELECT id, total_rooms, is_available FROM rooms WHERE hotel_id = $1',
+        [hotelId]
+    );
+    
+    // Get bookings for the specific date
+    const bookingsResult = await pool.query(
+        `SELECT room_type_id, COUNT(*) as booked_count 
+         FROM room_bookings 
+         WHERE hotel_id = $1 
+           AND status = 'confirmed'
+           AND check_in_date <= $2 
+           AND check_out_date > $2
+         GROUP BY room_type_id`,
+        [hotelId, targetDate]
+    );
+    
+    const bookedMap = {};
+    bookingsResult.rows.forEach(b => {
+        bookedMap[b.room_type_id] = parseInt(b.booked_count);
+    });
+    
+    let totalRooms = 0;
+    let totalAvailable = 0;
+    let totalBooked = 0;
+    
+    roomsResult.rows.forEach(room => {
+        if (room.is_available) {
+            const booked = bookedMap[room.id] || 0;
+            const total = room.total_rooms || 0;
+            totalRooms += total;
+            totalBooked += booked;
+            totalAvailable += Math.max(0, total - booked);
+        }
+    });
+    
+    // Get room bookings count for the specific date
+    const roomBookingsCount = await pool.query(
+        `SELECT COUNT(*) as count 
+         FROM room_bookings 
+         WHERE hotel_id = $1 
+           AND status = 'confirmed'
+           AND check_in_date <= $2 
+           AND check_out_date > $2`,
+        [hotelId, targetDate]
+    );
+    
+    // Get food orders for the specific date
+    const foodOrdersCount = await pool.query(
+        `SELECT COUNT(*) as count 
+         FROM food_orders 
+         WHERE hotel_id = $1 
+           AND status = 'confirmed'
+           AND pickup_date = $2`,
+        [hotelId, targetDate]
+    );
+    
+    return {
+        date: targetDate,
+        total_rooms: totalRooms,
+        available_rooms: totalAvailable,
+        booked_rooms: totalBooked,
+        room_bookings: parseInt(roomBookingsCount.rows[0].count),
+        food_orders: parseInt(foodOrdersCount.rows[0].count)
+    };
 }
 
 // ===== ADMIN ROUTES =====
@@ -433,6 +511,11 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             Math.max(0, Math.ceil((new Date(safeHotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
             0;
 
+        // Get date-specific statistics for today
+        const today = new Date().toISOString().split('T')[0];
+        const stats = await getDateSpecificStats(hotelId, today);
+
+        // Get room bookings for display (all, but we'll show date context)
         const roomBookings = await pool.query(
             `SELECT rb.*, COALESCE(r.room_type_name, 'Unknown') as room_type_name 
              FROM room_bookings rb
@@ -449,23 +532,6 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
-        // Get room stats with date-specific availability (using today's date)
-        const today = new Date().toISOString().split('T')[0];
-        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-        const roomsWithAvailability = await getRoomAvailability(hotelId, today, tomorrow);
-        
-        let totalRooms = 0;
-        let totalAvailable = 0;
-        let totalRoomTypes = 0;
-        
-        roomsWithAvailability.forEach(room => {
-            totalRooms += room.total_rooms || 0;
-            totalRoomTypes++;
-            if (room.is_available) {
-                totalAvailable += room.available_rooms || 0;
-            }
-        });
-
         res.json({
             ...safeHotel,
             is_visible: visible,
@@ -474,9 +540,12 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             room_bookings: roomBookings.rows || [],
             food_orders: foodOrders.rows || [],
             room_stats: {
-                total_room_types: totalRoomTypes,
-                total_rooms: totalRooms,
-                available_rooms: totalAvailable
+                total_rooms: stats.total_rooms,
+                available_rooms: stats.available_rooms,
+                booked_rooms: stats.booked_rooms,
+                room_bookings: stats.room_bookings,
+                food_orders: stats.food_orders,
+                date: stats.date
             }
         });
         
@@ -486,6 +555,20 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             error: 'Failed to load hotel details',
             message: error.message 
         });
+    }
+});
+
+// ===== DATE-SPECIFIC STATISTICS ENDPOINT =====
+app.get('/api/hotels/owner/:id/stats', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.id);
+    const { date } = req.query;
+    
+    try {
+        const stats = await getDateSpecificStats(hotelId, date);
+        res.json(stats);
+    } catch (error) {
+        console.error('Error fetching stats:', error);
+        res.status(500).json({ error: 'Failed to fetch statistics' });
     }
 });
 
@@ -571,10 +654,8 @@ app.get('/api/rooms/hotel/:hotelId/availability', isHotelOwner, async (req, res)
     try {
         let roomsWithAvailability;
         if (check_in && check_out) {
-            // Use the provided dates
             roomsWithAvailability = await getRoomAvailability(hotelId, check_in, check_out);
         } else {
-            // Default to today and tomorrow
             const today = new Date().toISOString().split('T')[0];
             const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
             roomsWithAvailability = await getRoomAvailability(hotelId, today, tomorrow);
