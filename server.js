@@ -322,9 +322,7 @@ app.get('/api/admin/users', isAdmin, async (req, res) => {
     }
 });
 
-// ===== HOTEL OWNER ROUTES (FIXED) =====
-
-// Get ALL hotels for the logged-in owner
+// ===== HOTEL OWNER ROUTES =====
 app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
     try {
         const result = await pool.query(
@@ -351,7 +349,6 @@ app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
     }
 });
 
-// Get single hotel details (for editing)
 app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.id);
     try {
@@ -409,7 +406,6 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
     }
 });
 
-// Update hotel
 app.put('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.id);
     const { hotelName, phone, city, country, address, description, starRating, meals, drinks, whats_new } = req.body;
@@ -467,7 +463,6 @@ app.post('/api/hotels/owner/:id/photos', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== CREATE HOTEL (OWNER) =====
 app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
     const { hotelName, city, country, phone, address, description, starRating } = req.body;
     try {
@@ -749,7 +744,9 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ===== MY BOOKINGS (FIXED) =====
+// ======================================================
+// ===== MY BOOKINGS (FIXED - handles missing columns) =====
+// ======================================================
 app.get('/api/my-bookings', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
@@ -770,33 +767,49 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Get room bookings
+        // Get room bookings - using COALESCE for safety
         const roomBookings = await pool.query(
             `SELECT 
-                rb.*, 
-                r.room_type_name, 
-                h.hotel_name,
+                rb.id,
+                rb.hotel_id,
+                rb.room_type_id,
+                rb.check_in_date,
+                rb.check_out_date,
+                rb.number_of_guests,
+                rb.total_amount,
+                rb.payment_status,
+                rb.status,
                 COALESCE(rb.client_name, 'N/A') as client_name,
                 COALESCE(rb.client_phone, 'N/A') as client_phone,
-                COALESCE(rb.booking_reference, 'N/A') as booking_reference
+                COALESCE(rb.booking_reference, 'N/A') as booking_reference,
+                COALESCE(r.room_type_name, 'Unknown') as room_type_name,
+                COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
              FROM room_bookings rb
-             JOIN rooms r ON rb.room_type_id = r.id
-             JOIN hotels h ON rb.hotel_id = h.id
+             LEFT JOIN rooms r ON rb.room_type_id = r.id
+             LEFT JOIN hotels h ON rb.hotel_id = h.id
              WHERE rb.client_id = $1 AND rb.status = 'confirmed'
              ORDER BY rb.created_at DESC`,
             [clientId]
         );
 
-        // Get food orders
+        // Get food orders - using COALESCE for safety
         const foodOrders = await pool.query(
             `SELECT 
-                fo.*, 
-                h.hotel_name,
+                fo.id,
+                fo.hotel_id,
+                fo.items,
+                fo.total_amount,
+                fo.pickup_date,
+                fo.pickup_time,
+                fo.special_instructions,
+                fo.payment_status,
+                fo.status,
                 COALESCE(fo.client_name, 'N/A') as client_name,
                 COALESCE(fo.client_phone, 'N/A') as client_phone,
-                COALESCE(fo.booking_reference, 'N/A') as booking_reference
+                COALESCE(fo.booking_reference, 'N/A') as booking_reference,
+                COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
              FROM food_orders fo
-             JOIN hotels h ON fo.hotel_id = h.id
+             LEFT JOIN hotels h ON fo.hotel_id = h.id
              WHERE fo.client_id = $1 AND fo.status = 'confirmed'
              ORDER BY fo.created_at DESC`,
             [clientId]
