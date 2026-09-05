@@ -170,26 +170,6 @@ const isHotelFeatured = async (hotelId) => {
     return expiry > new Date();
 };
 
-// ===== DEBUG ENDPOINT =====
-app.get('/api/debug/hotel/:id', isHotelOwner, async (req, res) => {
-    const hotelId = parseInt(req.params.id);
-    try {
-        const result = await pool.query(
-            'SELECT * FROM hotels WHERE id = $1 AND user_id = $2',
-            [hotelId, req.userId]
-        );
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Hotel not found or not owned by you' });
-        }
-        res.json({
-            hotel: result.rows[0],
-            columns: Object.keys(result.rows[0])
-        });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
 // ===== ADMIN ROUTES =====
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
     try {
@@ -369,20 +349,23 @@ app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== GET SINGLE HOTEL DETAILS (SAFE) =====
+// ===== GET SINGLE HOTEL DETAILS (FIXED - handles all errors) =====
 app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.id);
     try {
+        // First, check if the hotel exists and belongs to this owner
         const result = await pool.query(
             'SELECT * FROM hotels WHERE id = $1 AND user_id = $2',
             [hotelId, req.userId]
         );
+        
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'Hotel not found or not owned by you' });
         }
+        
         const hotel = result.rows[0];
 
-        // Build safe hotel object
+        // Build safe hotel object with fallbacks for every field
         const safeHotel = {
             id: hotel.id,
             user_id: hotel.user_id,
@@ -398,6 +381,7 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             subscription_expiry: hotel.subscription_expiry || null,
             is_featured: hotel.is_featured || false,
             featured_expiry: hotel.featured_expiry || null,
+            // IMPORTANT: Use fallback for meals, drinks, whats_new
             meals: hotel.meals || [],
             drinks: hotel.drinks || [],
             whats_new: hotel.whats_new || '',
@@ -411,8 +395,9 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             Math.max(0, Math.ceil((new Date(safeHotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
             0;
 
+        // Get room bookings (safe query)
         const roomBookings = await pool.query(
-            `SELECT rb.*, r.room_type_name 
+            `SELECT rb.*, COALESCE(r.room_type_name, 'Unknown') as room_type_name 
              FROM room_bookings rb
              LEFT JOIN rooms r ON rb.room_type_id = r.id
              WHERE rb.hotel_id = $1 AND rb.status = 'confirmed'
@@ -420,6 +405,7 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
+        // Get food orders (safe query)
         const foodOrders = await pool.query(
             `SELECT * FROM food_orders 
              WHERE hotel_id = $1 AND status = 'confirmed'
@@ -427,15 +413,17 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
+        // Get room stats
         const roomStats = await pool.query(
             `SELECT 
                 COUNT(*) as total_room_types,
-                SUM(total_rooms) as total_rooms,
-                SUM(CASE WHEN is_available THEN total_rooms ELSE 0 END) as available_rooms
+                COALESCE(SUM(total_rooms), 0) as total_rooms,
+                COALESCE(SUM(CASE WHEN is_available THEN total_rooms ELSE 0 END), 0) as available_rooms
              FROM rooms WHERE hotel_id = $1`,
             [hotelId]
         );
 
+        // Send the response
         res.json({
             ...safeHotel,
             is_visible: visible,
@@ -445,9 +433,14 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             food_orders: foodOrders.rows || [],
             room_stats: roomStats.rows[0] || { total_room_types: 0, total_rooms: 0, available_rooms: 0 }
         });
+        
     } catch (error) {
-        console.error('Error loading hotel details:', error);
-        res.status(500).json({ error: 'Failed to load hotel details: ' + error.message });
+        console.error('❌ Error loading hotel details:', error);
+        // Return a proper JSON error response
+        res.status(500).json({ 
+            error: 'Failed to load hotel details',
+            message: error.message 
+        });
     }
 });
 
@@ -789,9 +782,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ======================================================
 // ===== MY BOOKINGS =====
-// ======================================================
 app.get('/api/my-bookings', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
@@ -870,9 +861,7 @@ app.get('/api/my-bookings', async (req, res) => {
     }
 });
 
-// ======================================================
 // ===== FOOD ORDERS =====
-// ======================================================
 app.post('/api/food-orders', async (req, res) => {
     try {
         const { hotel_id, items, pickup_date, pickup_time, special_instructions } = req.body;
@@ -939,9 +928,7 @@ app.get('/api/food-orders/:id', async (req, res) => {
     }
 });
 
-// ======================================================
 // ===== ROOM BOOKINGS =====
-// ======================================================
 app.post('/api/room-bookings', async (req, res) => {
     try {
         const { room_type_id, check_in_date, check_out_date, number_of_guests, special_requests } = req.body;
@@ -1072,5 +1059,4 @@ app.get('/api/reviews/public', async (req, res) => {
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`👤 Admin: admin@hotelbooking.com / admin123`);
-    console.log(`🔍 Debug: /api/debug/hotel/:id`);
 });
