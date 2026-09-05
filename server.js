@@ -349,6 +349,7 @@ app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
     }
 });
 
+// ===== GET SINGLE HOTEL DETAILS (SAFE) =====
 app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.id);
     try {
@@ -391,18 +392,37 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
+        // Return hotel with safe defaults for missing columns
         res.json({
-            ...hotel,
+            id: hotel.id,
+            user_id: hotel.user_id,
+            hotel_name: hotel.hotel_name || '',
+            phone: hotel.phone || '',
+            address: hotel.address || '',
+            city: hotel.city || '',
+            country: hotel.country || '',
+            star_rating: hotel.star_rating || 3,
+            description: hotel.description || '',
+            photos: hotel.photos || [],
+            is_active: hotel.is_active !== undefined ? hotel.is_active : true,
+            subscription_expiry: hotel.subscription_expiry || null,
+            is_featured: hotel.is_featured || false,
+            featured_expiry: hotel.featured_expiry || null,
+            meals: hotel.meals || [],
+            drinks: hotel.drinks || [],
+            whats_new: hotel.whats_new || '',
+            created_at: hotel.created_at,
+            updated_at: hotel.updated_at,
             is_visible: visible,
             is_featured_active: featured,
             subscription_days_left: daysLeft,
-            room_bookings: roomBookings.rows,
-            food_orders: foodOrders.rows,
+            room_bookings: roomBookings.rows || [],
+            food_orders: foodOrders.rows || [],
             room_stats: roomStats.rows[0] || { total_room_types: 0, total_rooms: 0, available_rooms: 0 }
         });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Server error' });
+        console.error('Error loading hotel details:', error);
+        res.status(500).json({ error: 'Failed to load hotel details: ' + error.message });
     }
 });
 
@@ -745,7 +765,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
 });
 
 // ======================================================
-// ===== MY BOOKINGS - COMPLETELY SAFE VERSION =====
+// ===== MY BOOKINGS =====
 // ======================================================
 app.get('/api/my-bookings', async (req, res) => {
     try {
@@ -757,7 +777,6 @@ app.get('/api/my-bookings', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
 
-        // ----- UNLOCKED HOTELS -----
         const unlocked = await pool.query(
             `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
              FROM payments p
@@ -767,7 +786,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // ----- ROOM BOOKINGS (safe) -----
         const roomBookings = await pool.query(
             `SELECT 
                 rb.id,
@@ -793,7 +811,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // ----- FOOD ORDERS (safe) -----
         const foodOrders = await pool.query(
             `SELECT 
                 fo.id,
@@ -823,14 +840,8 @@ app.get('/api/my-bookings', async (req, res) => {
             food_orders: foodOrders.rows || []
         });
     } catch (error) {
-        console.error('❌ My bookings error:', error);
-        // Always return valid JSON, never throw an error
-        res.json({
-            unlocked_hotels: [],
-            room_bookings: [],
-            food_orders: [],
-            error: error.message
-        });
+        console.error('My bookings error:', error);
+        res.json({ unlocked_hotels: [], room_bookings: [], food_orders: [] });
     }
 });
 
