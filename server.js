@@ -655,7 +655,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ===== MY BOOKINGS (FIXED) =====
+// ===== MY BOOKINGS =====
 app.get('/api/my-bookings', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
@@ -666,7 +666,6 @@ app.get('/api/my-bookings', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
 
-        // Get unlocked hotels
         const unlocked = await pool.query(
             `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
              FROM payments p
@@ -676,7 +675,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Get room bookings
         const roomBookings = await pool.query(
             `SELECT rb.*, r.room_type_name, h.hotel_name 
              FROM room_bookings rb
@@ -687,7 +685,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Get food orders
         const foodOrders = await pool.query(
             `SELECT fo.*, h.hotel_name 
              FROM food_orders fo
@@ -709,7 +706,7 @@ app.get('/api/my-bookings', async (req, res) => {
 });
 
 // ======================================================
-// ===== FOOD ORDERS (FIXED - no middleware) =====
+// ===== FOOD ORDERS =====
 // ======================================================
 app.post('/api/food-orders', async (req, res) => {
     try {
@@ -739,8 +736,47 @@ app.post('/api/food-orders', async (req, res) => {
     }
 });
 
+// ✅ CONFIRM FOOD ORDER PAYMENT
+app.post('/api/food-orders/:id/confirm-payment', async (req, res) => {
+    const orderId = parseInt(req.params.id);
+    const { payment_method, payment_reference } = req.body;
+    try {
+        const result = await pool.query(
+            `UPDATE food_orders SET
+                payment_status = 'paid',
+                payment_method = $1,
+                payment_reference = $2,
+                status = 'confirmed'
+             WHERE id = $3
+             RETURNING *`,
+            [payment_method, payment_reference, orderId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Order not found' });
+        }
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Confirm payment error:', error);
+        res.status(500).json({ error: 'Failed to confirm payment: ' + error.message });
+    }
+});
+
+app.get('/api/food-orders/:id', async (req, res) => {
+    const id = parseInt(req.params.id);
+    try {
+        const result = await pool.query('SELECT * FROM food_orders WHERE id = $1', [id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Order not found' });
+        }
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 // ======================================================
-// ===== ROOM BOOKINGS (FIXED - no middleware) =====
+// ===== ROOM BOOKINGS =====
 // ======================================================
 app.post('/api/room-bookings', async (req, res) => {
     try {
@@ -776,6 +812,52 @@ app.post('/api/room-bookings', async (req, res) => {
     } catch (error) {
         console.error('Room booking error:', error);
         res.status(500).json({ error: 'Failed to book room: ' + error.message });
+    }
+});
+
+// ✅ CONFIRM ROOM BOOKING PAYMENT
+app.post('/api/room-bookings/:id/confirm-payment', async (req, res) => {
+    const bookingId = parseInt(req.params.id);
+    const { payment_method, payment_reference } = req.body;
+    try {
+        const result = await pool.query(
+            `UPDATE room_bookings SET
+                payment_status = 'paid',
+                payment_method = $1,
+                payment_reference = $2,
+                status = 'confirmed'
+             WHERE id = $3
+             RETURNING *`,
+            [payment_method, payment_reference, bookingId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Booking not found' });
+        }
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Confirm payment error:', error);
+        res.status(500).json({ error: 'Failed to confirm payment: ' + error.message });
+    }
+});
+
+app.get('/api/room-bookings/:id', async (req, res) => {
+    const id = parseInt(req.params.id);
+    try {
+        const result = await pool.query(
+            `SELECT rb.*, r.room_type_name, h.hotel_name 
+             FROM room_bookings rb
+             JOIN rooms r ON rb.room_type_id = r.id
+             JOIN hotels h ON rb.hotel_id = h.id
+             WHERE rb.id = $1`,
+            [id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Booking not found' });
+        }
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
