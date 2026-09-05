@@ -170,6 +170,45 @@ const isHotelFeatured = async (hotelId) => {
     return expiry > new Date();
 };
 
+// ===== GET ROOM AVAILABILITY HELPER =====
+async function getRoomAvailability(hotelId) {
+    // Get all rooms for this hotel
+    const roomsResult = await pool.query(
+        'SELECT * FROM rooms WHERE hotel_id = $1',
+        [hotelId]
+    );
+    
+    // Get all confirmed bookings with future dates
+    const bookingsResult = await pool.query(
+        `SELECT room_type_id, COUNT(*) as booked_count 
+         FROM room_bookings 
+         WHERE hotel_id = $1 
+           AND status = 'confirmed' 
+           AND check_out_date >= CURRENT_DATE
+         GROUP BY room_type_id`,
+        [hotelId]
+    );
+    
+    // Create a map of booked counts per room type
+    const bookedMap = {};
+    bookingsResult.rows.forEach(b => {
+        bookedMap[b.room_type_id] = parseInt(b.booked_count);
+    });
+    
+    // Calculate available rooms for each room type
+    return roomsResult.rows.map(room => {
+        const booked = bookedMap[room.id] || 0;
+        const total = room.total_rooms || 0;
+        const available = Math.max(0, total - booked);
+        return {
+            ...room,
+            booked_count: booked,
+            available_rooms: available,
+            total_rooms: total
+        };
+    });
+}
+
 // ===== ADMIN ROUTES =====
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
     try {
@@ -407,14 +446,39 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
-        const roomStats = await pool.query(
-            `SELECT 
-                COUNT(*) as total_room_types,
-                COALESCE(SUM(total_rooms), 0) as total_rooms,
-                COALESCE(SUM(CASE WHEN is_available THEN total_rooms ELSE 0 END), 0) as available_rooms
-             FROM rooms WHERE hotel_id = $1`,
+        // Get room stats with availability
+        const roomsResult = await pool.query(
+            'SELECT id, total_rooms, is_available FROM rooms WHERE hotel_id = $1',
             [hotelId]
         );
+        
+        const bookedStats = await pool.query(
+            `SELECT room_type_id, COUNT(*) as booked_count 
+             FROM room_bookings 
+             WHERE hotel_id = $1 
+               AND status = 'confirmed' 
+               AND check_out_date >= CURRENT_DATE
+             GROUP BY room_type_id`,
+            [hotelId]
+        );
+        
+        const bookedMap = {};
+        bookedStats.rows.forEach(b => {
+            bookedMap[b.room_type_id] = parseInt(b.booked_count);
+        });
+
+        let totalRooms = 0;
+        let totalAvailable = 0;
+        let totalRoomTypes = 0;
+        
+        roomsResult.rows.forEach(room => {
+            totalRooms += room.total_rooms || 0;
+            totalRoomTypes++;
+            if (room.is_available) {
+                const booked = bookedMap[room.id] || 0;
+                totalAvailable += Math.max(0, (room.total_rooms || 0) - booked);
+            }
+        });
 
         res.json({
             ...safeHotel,
@@ -423,7 +487,11 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             subscription_days_left: daysLeft,
             room_bookings: roomBookings.rows || [],
             food_orders: foodOrders.rows || [],
-            room_stats: roomStats.rows[0] || { total_room_types: 0, total_rooms: 0, available_rooms: 0 }
+            room_stats: {
+                total_room_types: totalRoomTypes,
+                total_rooms: totalRooms,
+                available_rooms: totalAvailable
+            }
         });
         
     } catch (error) {
@@ -506,6 +574,18 @@ app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
     } catch (error) {
         console.error('Create hotel error:', error);
         res.status(500).json({ error: 'Failed to create hotel: ' + error.message });
+    }
+});
+
+// ===== GET ROOMS WITH AVAILABILITY (OWNER) =====
+app.get('/api/rooms/hotel/:hotelId/availability', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    try {
+        const roomsWithAvailability = await getRoomAvailability(hotelId);
+        res.json(roomsWithAvailability);
+    } catch (error) {
+        console.error('Error fetching room availability:', error);
+        res.status(500).json({ error: 'Failed to fetch availability' });
     }
 });
 
@@ -629,7 +709,43 @@ app.get('/api/hotels/:id', async (req, res) => {
             } catch (e) { /* ignore */ }
         }
 
-        const rooms = await pool.query('SELECT * FROM rooms WHERE hotel_id = $1 AND is_available = TRUE', [id]);
+        // Get rooms with availability for public view
+        const roomsResult = await pool.query(
+            'SELECT * FROM rooms WHERE hotel_id = $1 AND is_available = TRUE',
+            [id]
+        );
+        
+        const bookingsResult = await pool.query(
+            `SELECT room_type_id, COUNT(*) as booked_count 
+             FROM room_bookings 
+             WHERE hotel_id = $1 
+               AND status = 'confirmed' 
+               AND check_out_date >= CURRENT_DATE
+             GROUP BY room_type_id`,
+            [id]
+        );
+        
+        const bookedMap = {};
+        bookingsResult.rows.forEach(b => {
+            bookedMap[b.room_type_id] = parseInt(b.booked_count);
+        });
+
+        const rooms = roomsResult.rows.map(r => {
+            const booked = bookedMap[r.id] || 0;
+            const total = r.total_rooms || 0;
+            const available = Math.max(0, total - booked);
+            return {
+                id: r.id,
+                name: r.room_type_name,
+                capacity: r.capacity,
+                price_per_night: hasAccess ? r.base_price_per_night : null,
+                total_rooms: total,
+                booked_count: booked,
+                available_rooms: available,
+                is_available: r.is_available && available > 0
+            };
+        });
+
         const confs = await pool.query('SELECT * FROM conference_rooms WHERE hotel_id = $1', [id]);
         const reviews = await pool.query(
             'SELECT id, user_name, rating, comment, created_at FROM reviews WHERE hotel_id = $1 ORDER BY created_at DESC',
@@ -654,14 +770,7 @@ app.get('/api/hotels/:id', async (req, res) => {
             description: hotel.description,
             photos: hotel.photos || [],
             is_featured: featured,
-            room_types: rooms.rows.map(r => ({
-                id: r.id,
-                name: r.room_type_name,
-                capacity: r.capacity,
-                price_per_night: hasAccess ? r.base_price_per_night : null,
-                total_rooms: r.total_rooms,
-                is_available: r.is_available
-            })),
+            room_types: rooms,
             conference_rooms: confs.rows.map(c => ({
                 id: c.id,
                 name: c.room_name,
@@ -773,7 +882,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
     }
 });
 
-// ===== MY BOOKINGS (FIXED: safe JSON parsing) =====
+// ===== MY BOOKINGS =====
 app.get('/api/my-bookings', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
@@ -841,7 +950,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // ✅ FIX: Parse items safely
         const parsedFoodOrders = foodOrders.rows.map(o => ({
             ...o,
             items: typeof o.items === 'string' ? JSON.parse(o.items) : (o.items || [])
@@ -887,7 +995,6 @@ app.post('/api/food-orders', async (req, res) => {
     }
 });
 
-// ===== WALK-IN FOOD ORDER =====
 app.post('/api/food-orders/walk-in', isHotelOwner, async (req, res) => {
     try {
         const { hotel_id, items, pickup_date, pickup_time, client_name, client_phone, special_instructions } = req.body;
@@ -948,7 +1055,7 @@ app.get('/api/food-orders/:id', async (req, res) => {
     }
 });
 
-// ===== ROOM BOOKINGS =====
+// ===== ROOM BOOKINGS (WITH AVAILABILITY CHECK) =====
 app.post('/api/room-bookings', async (req, res) => {
     try {
         const { room_type_id, check_in_date, check_out_date, number_of_guests, special_requests } = req.body;
@@ -961,11 +1068,30 @@ app.post('/api/room-bookings', async (req, res) => {
         const clientId = decoded.id;
 
         const room = await pool.query(
-            'SELECT r.*, h.id as hotel_id FROM rooms r JOIN hotels h ON r.hotel_id = h.id WHERE r.id = $1 AND r.is_available = TRUE',
+            'SELECT r.*, h.id as hotel_id FROM rooms r JOIN hotels h ON r.hotel_id = h.id WHERE r.id = $1',
             [room_type_id]
         );
         if (room.rows.length === 0) {
-            return res.status(404).json({ error: 'Room not found or unavailable' });
+            return res.status(404).json({ error: 'Room not found' });
+        }
+
+        // Check availability
+        const bookingCheck = await pool.query(
+            `SELECT COUNT(*) as booked_count 
+             FROM room_bookings 
+             WHERE room_type_id = $1 
+               AND status = 'confirmed'
+               AND check_in_date < $2 
+               AND check_out_date > $3`,
+            [room_type_id, check_out_date, check_in_date]
+        );
+
+        const bookedCount = parseInt(bookingCheck.rows[0].booked_count);
+        const totalRooms = room.rows[0].total_rooms || 0;
+        const availableRooms = totalRooms - bookedCount;
+
+        if (availableRooms <= 0) {
+            return res.status(400).json({ error: 'No rooms available for the selected dates' });
         }
 
         const days = Math.ceil((new Date(check_out_date) - new Date(check_in_date)) / (1000 * 60 * 60 * 24));
@@ -986,17 +1112,35 @@ app.post('/api/room-bookings', async (req, res) => {
     }
 });
 
-// ===== WALK-IN ROOM BOOKING =====
 app.post('/api/room-bookings/walk-in', isHotelOwner, async (req, res) => {
     try {
         const { hotel_id, room_type_id, check_in_date, check_out_date, number_of_guests, client_name, client_phone, special_requests } = req.body;
         
         const room = await pool.query(
-            'SELECT * FROM rooms WHERE id = $1 AND is_available = TRUE',
+            'SELECT * FROM rooms WHERE id = $1',
             [room_type_id]
         );
         if (room.rows.length === 0) {
-            return res.status(404).json({ error: 'Room not found or unavailable' });
+            return res.status(404).json({ error: 'Room not found' });
+        }
+
+        // Check availability
+        const bookingCheck = await pool.query(
+            `SELECT COUNT(*) as booked_count 
+             FROM room_bookings 
+             WHERE room_type_id = $1 
+               AND status = 'confirmed'
+               AND check_in_date < $2 
+               AND check_out_date > $3`,
+            [room_type_id, check_out_date, check_in_date]
+        );
+
+        const bookedCount = parseInt(bookingCheck.rows[0].booked_count);
+        const totalRooms = room.rows[0].total_rooms || 0;
+        const availableRooms = totalRooms - bookedCount;
+
+        if (availableRooms <= 0) {
+            return res.status(400).json({ error: 'No rooms available for the selected dates' });
         }
 
         const days = Math.ceil((new Date(check_out_date) - new Date(check_in_date)) / (1000 * 60 * 60 * 24));
@@ -1248,24 +1392,17 @@ app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
     }
 });
 
-// ===== CONFERENCE ROOM MANAGEMENT (FIXED: accepts both body formats) =====
+// ===== CONFERENCE ROOM MANAGEMENT =====
 app.post('/api/conference/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
-    // Accept both camelCase (frontend) and snake_case (backend) fields
-    const { 
-        roomName, room_name,
-        capacity, 
-        pricePerHour, price_per_hour,
-        amenities 
-    } = req.body;
+    const { roomName, room_name, capacity, pricePerHour, price_per_hour, amenities } = req.body;
     
     const finalRoomName = roomName || room_name;
     const finalPrice = pricePerHour || price_per_hour;
     
     if (!finalRoomName || !capacity || !finalPrice) {
         return res.status(400).json({ 
-            error: 'Missing required fields. Need: roomName/room_name, capacity, pricePerHour/price_per_hour',
-            received: req.body 
+            error: 'Missing required fields. Need: roomName/room_name, capacity, pricePerHour/price_per_hour'
         });
     }
 
@@ -1291,7 +1428,6 @@ app.post('/api/conference/:hotelId', isHotelOwner, async (req, res) => {
     }
 });
 
-// Also support POST to /api/conference without hotelId in URL (for compatibility)
 app.post('/api/conference', isHotelOwner, async (req, res) => {
     const { hotel_id, hotelId, roomName, room_name, capacity, pricePerHour, price_per_hour, amenities } = req.body;
     const finalHotelId = hotel_id || hotelId;
