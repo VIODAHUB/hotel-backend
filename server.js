@@ -1113,7 +1113,6 @@ app.get('/api/food-orders/:id', async (req, res) => {
         res.status(500).json({ error: 'Server error' });
     }
 });
-
 // ===== ROOM BOOKINGS (WITH DATE-SPECIFIC AVAILABILITY CHECK) =====
 app.post('/api/room-bookings', async (req, res) => {
     try {
@@ -1219,7 +1218,71 @@ app.post('/api/room-bookings/walk-in', isHotelOwner, async (req, res) => {
         res.status(500).json({ error: 'Failed to book room: ' + error.message });
     }
 });
-
+// ===== PUBLIC: GET ROOM AVAILABILITY FOR CLIENTS =====
+app.get('/api/rooms/public/:hotelId/availability', async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    const { check_in, check_out } = req.query;
+    
+    try {
+        // Check if hotel is visible
+        const visible = await isHotelVisible(hotelId);
+        if (!visible) {
+            return res.status(403).json({ error: 'Hotel is currently unavailable' });
+        }
+        
+        // Get all rooms for this hotel
+        const roomsResult = await pool.query(
+            'SELECT * FROM rooms WHERE hotel_id = $1 AND is_available = TRUE',
+            [hotelId]
+        );
+        
+        if (roomsResult.rows.length === 0) {
+            return res.json([]);
+        }
+        
+        // Get booked counts for the specific dates
+        let bookedMap = {};
+        if (check_in && check_out) {
+            const bookingsResult = await pool.query(
+                `SELECT room_type_id, COUNT(*) as booked_count 
+                 FROM room_bookings 
+                 WHERE hotel_id = $1 
+                   AND status = 'confirmed'
+                   AND check_in_date < $2 
+                   AND check_out_date > $3
+                 GROUP BY room_type_id`,
+                [hotelId, check_out, check_in]
+            );
+            
+            bookingsResult.rows.forEach(b => {
+                bookedMap[b.room_type_id] = parseInt(b.booked_count);
+            });
+        }
+        
+        // Calculate available rooms for each room type
+        const roomsWithAvailability = roomsResult.rows.map(room => {
+            const booked = bookedMap[room.id] || 0;
+            const total = room.total_rooms || 0;
+            const available = Math.max(0, total - booked);
+            return {
+                id: room.id,
+                room_type_name: room.room_type_name,
+                capacity: room.capacity,
+                base_price_per_night: room.base_price_per_night,
+                total_rooms: total,
+                booked_count: booked,
+                available_rooms: available,
+                is_available: room.is_available && available > 0
+            };
+        });
+        
+        res.json(roomsWithAvailability);
+        
+    } catch (error) {
+        console.error('Error fetching public room availability:', error);
+        res.status(500).json({ error: 'Failed to fetch availability' });
+    }
+});
 app.post('/api/room-bookings/:id/confirm-payment', async (req, res) => {
     const bookingId = parseInt(req.params.id);
     const { payment_method, payment_reference } = req.body;
