@@ -1718,7 +1718,31 @@ app.post('/api/payments/subscribe/:hotelId', isHotelOwner, async (req, res) => {
         res.status(500).json({ error: 'Subscription failed: ' + error.message });
     }
 });
-
+// ===== ADMIN: TOGGLE USER STATUS =====
+app.put('/api/admin/users/:id/status', isAdmin, async (req, res) => {
+    const userId = parseInt(req.params.id);
+    const { is_verified } = req.body;
+    
+    try {
+        // Don't allow disabling admin accounts
+        const userCheck = await pool.query('SELECT user_type FROM users WHERE id = $1', [userId]);
+        if (userCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        if (userCheck.rows[0].user_type === 'admin') {
+            return res.status(403).json({ error: 'Cannot disable admin accounts' });
+        }
+        
+        const result = await pool.query(
+            'UPDATE users SET is_verified = $1 WHERE id = $2 RETURNING id, email, user_type, is_verified',
+            [is_verified, userId]
+        );
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Toggle user status error:', error);
+        res.status(500).json({ error: 'Failed to update user status' });
+    }
+});
 // ===== START SERVER =====
 app.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
