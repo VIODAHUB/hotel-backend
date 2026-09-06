@@ -1724,13 +1724,12 @@ app.put('/api/admin/users/:id/status', isAdmin, async (req, res) => {
     const { is_verified } = req.body;
     
     try {
-        // Don't allow disabling admin accounts
         const userCheck = await pool.query('SELECT user_type FROM users WHERE id = $1', [userId]);
         if (userCheck.rows.length === 0) {
             return res.status(404).json({ error: 'User not found' });
         }
         if (userCheck.rows[0].user_type === 'admin') {
-            return res.status(403).json({ error: 'Cannot disable admin accounts' });
+            return res.status(403).json({ error: 'Cannot modify admin accounts' });
         }
         
         const result = await pool.query(
@@ -1741,6 +1740,27 @@ app.put('/api/admin/users/:id/status', isAdmin, async (req, res) => {
     } catch (error) {
         console.error('Toggle user status error:', error);
         res.status(500).json({ error: 'Failed to update user status' });
+    }
+});
+
+// ===== ADMIN: DELETE USER =====
+app.delete('/api/admin/users/:id', isAdmin, async (req, res) => {
+    const userId = parseInt(req.params.id);
+    
+    try {
+        const userCheck = await pool.query('SELECT user_type FROM users WHERE id = $1', [userId]);
+        if (userCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        if (userCheck.rows[0].user_type === 'admin') {
+            return res.status(403).json({ error: 'Cannot delete admin accounts' });
+        }
+        
+        await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+        res.json({ message: 'User deleted successfully' });
+    } catch (error) {
+        console.error('Delete user error:', error);
+        res.status(500).json({ error: 'Failed to delete user' });
     }
 });
 // ===== START SERVER =====
