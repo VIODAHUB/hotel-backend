@@ -22,7 +22,7 @@ pool.connect((err) => {
 });
 
 // ============================================================
-//  TUMA PAYMENT CONFIGURATION
+//  TUMA PAYMENT CONFIGURATION - REAL MODE
 // ============================================================
 
 const TUMA_CONFIG = {
@@ -30,107 +30,122 @@ const TUMA_CONFIG = {
     EMAIL: process.env.TUMA_EMAIL,
     API_KEY: process.env.TUMA_API_KEY,
     CALLBACK_URL: process.env.TUMA_CALLBACK_URL || 'https://hotel-backend-s79n.onrender.com/api/payment-callback',
-    TIMEOUT: 30000,
-    // Enable mock mode if no credentials or for testing
-    MOCK_MODE: process.env.TUMA_MOCK_MODE === 'true' || !process.env.TUMA_EMAIL || !process.env.TUMA_API_KEY
+    TIMEOUT: 30000
 };
 
-console.log('📋 Tuma Configuration:');
+console.log('='.repeat(50));
+console.log('📋 TUMA PAYMENT CONFIGURATION:');
 console.log('   API URL:', TUMA_CONFIG.API_URL);
-console.log('   Email:', TUMA_CONFIG.EMAIL ? '✅ Set' : '❌ Missing');
-console.log('   API Key:', TUMA_CONFIG.API_KEY ? '✅ Set' : '❌ Missing');
-console.log('   Mock Mode:', TUMA_CONFIG.MOCK_MODE ? '✅ Enabled' : '❌ Disabled');
+console.log('   Email:', TUMA_CONFIG.EMAIL ? '✅ Set' : '❌ MISSING');
+console.log('   API Key:', TUMA_CONFIG.API_KEY ? '✅ Set (' + TUMA_CONFIG.API_KEY.substring(0, 10) + '...)' : '❌ MISSING');
+console.log('   Callback URL:', TUMA_CONFIG.CALLBACK_URL);
+console.log('='.repeat(50));
+
+// Validate Tuma credentials
+if (!TUMA_CONFIG.EMAIL || !TUMA_CONFIG.API_KEY) {
+    console.error('❌ CRITICAL: Missing Tuma credentials!');
+    console.error('   Please set TUMA_EMAIL and TUMA_API_KEY environment variables.');
+    console.error('   The server will start but payment will fail.');
+}
 
 // ============================================================
-//  TUMA API HELPER FUNCTIONS
+//  TUMA API HELPER FUNCTIONS - WITH EXTENSIVE LOGGING
 // ============================================================
 
 async function getTumaToken() {
-    // If in mock mode, return a fake token
-    if (TUMA_CONFIG.MOCK_MODE) {
-        console.log('🔑 [MOCK] Using fake token');
-        return 'mock_token_' + Date.now();
-    }
-
+    console.log('\n🔑 [TUMA] Getting authentication token...');
+    console.log(`   📧 Email: ${TUMA_CONFIG.EMAIL}`);
+    console.log(`   🔗 URL: ${TUMA_CONFIG.API_URL}/auth/token`);
+    
     try {
-        console.log('🔑 Getting Tuma token...');
-        console.log('📧 Using email:', TUMA_CONFIG.EMAIL);
-        console.log('🌐 API URL:', `${TUMA_CONFIG.API_URL}/auth/token`);
+        const requestBody = {
+            email: TUMA_CONFIG.EMAIL,
+            api_key: TUMA_CONFIG.API_KEY
+        };
+        
+        console.log('   📤 Request Body:', JSON.stringify(requestBody, null, 2));
         
         const response = await fetch(`${TUMA_CONFIG.API_URL}/auth/token`, {
             method: 'POST',
             headers: { 
                 'Content-Type': 'application/json',
-                'Accept': 'application/json'
+                'Accept': 'application/json',
+                'User-Agent': 'Hotel-Backend/1.0'
             },
-            body: JSON.stringify({
-                email: TUMA_CONFIG.EMAIL,
-                api_key: TUMA_CONFIG.API_KEY
-            })
+            body: JSON.stringify(requestBody)
         });
         
+        console.log(`   📥 Response Status: ${response.status} ${response.statusText}`);
+        console.log(`   📥 Response Headers:`, Object.fromEntries(response.headers));
+        
         const responseText = await response.text();
-        console.log('📄 Auth response status:', response.status);
-        console.log('📄 Auth response:', responseText.substring(0, 500));
+        console.log(`   📄 Response Body: ${responseText.substring(0, 500)}`);
         
         if (!response.ok) {
-            console.error('❌ Tuma auth failed:', response.status, responseText);
+            console.error(`❌ [TUMA] Authentication failed with status ${response.status}`);
+            console.error(`   Response: ${responseText}`);
             throw new Error(`Tuma auth failed: ${response.status} - ${responseText}`);
         }
         
-        const data = JSON.parse(responseText);
-        console.log('📥 Parsed auth response:', JSON.stringify(data, null, 2));
-        
-        // Try different possible token locations
-        const token = data.token || data.access_token || data.data?.token || data.data?.access_token;
-        
-        if (!token) {
-            console.error('❌ No token found in response. Response structure:', Object.keys(data));
-            throw new Error('No token received from Tuma');
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch (e) {
+            console.error('❌ [TUMA] Failed to parse JSON response:', e.message);
+            throw new Error('Invalid JSON response from Tuma');
         }
         
-        console.log('✅ Tuma token obtained successfully');
+        console.log('   📊 Parsed Response Structure:', Object.keys(data));
+        
+        // Try multiple possible token locations
+        const token = data.token || 
+                     data.access_token || 
+                     data.data?.token || 
+                     data.data?.access_token ||
+                     data.auth_token;
+        
+        if (!token) {
+            console.error('❌ [TUMA] No token found in response. Available keys:', Object.keys(data));
+            console.error('   Full response:', JSON.stringify(data, null, 2));
+            throw new Error('No token received from Tuma - check your credentials');
+        }
+        
+        console.log('✅ [TUMA] Token obtained successfully!');
+        console.log(`   Token: ${token.substring(0, 20)}...`);
         return token;
+        
     } catch (error) {
-        console.error('❌ Tuma token error:', error.message);
-        // If real auth fails, fall back to mock mode
-        console.log('⚠️ Falling back to mock mode');
-        TUMA_CONFIG.MOCK_MODE = true;
-        return 'mock_token_' + Date.now();
+        console.error('❌ [TUMA] Token error:', error.message);
+        if (error.stack) {
+            console.error('   Stack:', error.stack);
+        }
+        throw error;
     }
 }
 
 async function initiateTumaPayment(phone, amount, description, reference) {
-    // MOCK MODE - Simulate payment without real Tuma
-    if (TUMA_CONFIG.MOCK_MODE) {
-        console.log('🔧 [MOCK] Simulating Tuma payment...');
-        console.log(`   Phone: ${phone}, Amount: ${amount}, Reference: ${reference}`);
-        
-        // Generate a fake transaction ID
-        const fakeTransactionId = 'MOCK-' + Date.now().toString().slice(-8);
-        
-        // In mock mode, always succeed after 3 seconds (simulate STK push)
-        setTimeout(() => {
-            console.log(`✅ [MOCK] Payment completed: ${fakeTransactionId}`);
-        }, 3000);
-        
-        return {
-            success: true,
-            transaction_id: fakeTransactionId,
-            message: 'Payment initiated (MOCK)',
-            mock: true
-        };
-    }
-
-    // REAL TUMA PAYMENT
+    console.log('\n💳 [TUMA] Initiating payment...');
+    console.log(`   📱 Phone: ${phone}`);
+    console.log(`   💰 Amount: ${amount}`);
+    console.log(`   📝 Reference: ${reference}`);
+    
     try {
+        // Get token first
         const token = await getTumaToken();
-        console.log('✅ Token obtained, initiating payment...');
+        console.log('✅ [TUMA] Token obtained, proceeding with payment...');
         
         // Format phone number for Tuma (254XXXXXXXXX)
         const cleanPhone = phone.replace(/[^0-9]/g, '');
-        const formattedPhone = cleanPhone.startsWith('0') ? '254' + cleanPhone.slice(1) : 
-                              cleanPhone.startsWith('254') ? cleanPhone : '254' + cleanPhone;
+        let formattedPhone;
+        if (cleanPhone.startsWith('0')) {
+            formattedPhone = '254' + cleanPhone.slice(1);
+        } else if (cleanPhone.startsWith('254')) {
+            formattedPhone = cleanPhone;
+        } else {
+            formattedPhone = '254' + cleanPhone;
+        }
+        
+        console.log(`   📱 Formatted Phone: ${formattedPhone}`);
         
         const payload = {
             amount: amount,
@@ -140,62 +155,73 @@ async function initiateTumaPayment(phone, amount, description, reference) {
             reference: reference || 'HOTBOOK-' + Date.now()
         };
         
-        console.log('📤 Sending Tuma payment payload:', { ...payload, phone: formattedPhone });
+        console.log('   📤 Payment Payload:', JSON.stringify(payload, null, 2));
+        console.log(`   🔗 URL: ${TUMA_CONFIG.API_URL}/payment/stk-push`);
         
         const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/stk-push`, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${token}`,
                 'Content-Type': 'application/json',
-                'Accept': 'application/json'
+                'Accept': 'application/json',
+                'User-Agent': 'Hotel-Backend/1.0'
             },
             body: JSON.stringify(payload)
         });
         
+        console.log(`   📥 Response Status: ${response.status} ${response.statusText}`);
+        
         const responseText = await response.text();
-        console.log('📄 Payment response status:', response.status);
-        console.log('📄 Payment response:', responseText.substring(0, 500));
+        console.log(`   📄 Response Body: ${responseText.substring(0, 500)}`);
         
         if (!response.ok) {
-            console.error('❌ Payment request failed:', response.status, responseText);
+            console.error(`❌ [TUMA] Payment request failed with status ${response.status}`);
+            console.error(`   Response: ${responseText}`);
             throw new Error(`Payment request failed: ${response.status} - ${responseText}`);
         }
         
-        const result = JSON.parse(responseText);
-        console.log('📥 Tuma payment result:', result);
+        let result;
+        try {
+            result = JSON.parse(responseText);
+        } catch (e) {
+            console.error('❌ [TUMA] Failed to parse payment response:', e.message);
+            throw new Error('Invalid JSON response from Tuma payment');
+        }
         
-        // Handle different response structures
-        const transactionId = result.transaction_id || result.data?.transaction_id || result.id || 'pending';
+        console.log('   📊 Payment Response Structure:', Object.keys(result));
+        console.log('   📊 Payment Response:', JSON.stringify(result, null, 2));
+        
+        // Extract transaction ID from various possible locations
+        const transactionId = result.transaction_id || 
+                             result.data?.transaction_id || 
+                             result.id || 
+                             result.reference ||
+                             'pending';
+        
+        console.log(`✅ [TUMA] Payment initiated successfully!`);
+        console.log(`   Transaction ID: ${transactionId}`);
         
         return {
             success: true,
             transaction_id: transactionId,
-            ...result
+            raw_response: result
         };
+        
     } catch (error) {
-        console.error('❌ Tuma payment error:', error.message);
-        // Fallback to mock mode on error
-        console.log('⚠️ Falling back to mock mode for this payment');
-        return initiateTumaPayment(phone, amount, description, reference);
+        console.error('❌ [TUMA] Payment error:', error.message);
+        if (error.stack) {
+            console.error('   Stack:', error.stack);
+        }
+        throw error;
     }
 }
 
 async function checkTumaPaymentStatus(transactionId) {
-    // MOCK MODE - Simulate status check
-    if (TUMA_CONFIG.MOCK_MODE || transactionId.startsWith('MOCK-')) {
-        console.log(`🔍 [MOCK] Checking payment status: ${transactionId}`);
-        // 80% chance of being completed in mock mode
-        const isCompleted = Math.random() < 0.8;
-        return {
-            status: isCompleted ? 'completed' : 'pending',
-            paid: isCompleted,
-            transaction_id: transactionId
-        };
-    }
-
+    console.log(`\n🔍 [TUMA] Checking payment status: ${transactionId}`);
+    
     try {
         const token = await getTumaToken();
-        console.log(`🔍 Checking payment status for: ${transactionId}`);
+        console.log('✅ [TUMA] Token obtained, checking status...');
         
         const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/status/${transactionId}`, {
             method: 'GET',
@@ -206,25 +232,32 @@ async function checkTumaPaymentStatus(transactionId) {
             }
         });
         
+        console.log(`   📥 Response Status: ${response.status}`);
+        
         const responseText = await response.text();
-        console.log('📄 Status response:', responseText.substring(0, 500));
+        console.log(`   📄 Response: ${responseText.substring(0, 500)}`);
         
         if (!response.ok) {
-            console.error('❌ Status check failed:', response.status, responseText);
+            console.error(`❌ [TUMA] Status check failed: ${response.status}`);
             return { status: 'pending', paid: false };
         }
         
         const result = JSON.parse(responseText);
+        console.log('   📊 Status Response:', JSON.stringify(result, null, 2));
+        
         const status = result.status || result.data?.status || 'pending';
         const paid = status === 'completed' || status === 'paid' || status === 'success';
+        
+        console.log(`   📊 Status: ${status}, Paid: ${paid}`);
         
         return {
             status: status,
             paid: paid,
             ...result
         };
+        
     } catch (error) {
-        console.error('❌ Tuma status check error:', error.message);
+        console.error('❌ [TUMA] Status check error:', error.message);
         return { status: 'pending', paid: false };
     }
 }
@@ -234,7 +267,9 @@ async function checkTumaPaymentStatus(transactionId) {
 // ============================================================
 
 app.post('/api/payment-callback', express.json({ type: 'application/json' }), async (req, res) => {
-    console.log('📥 Payment callback received:', req.body);
+    console.log('\n📥 [CALLBACK] Payment callback received!');
+    console.log('   Headers:', req.headers);
+    console.log('   Body:', JSON.stringify(req.body, null, 2));
     
     try {
         const { 
@@ -248,37 +283,44 @@ app.post('/api/payment-callback', express.json({ type: 'application/json' }), as
         
         // Always respond immediately to Tuma
         res.status(200).json({ status: 'received' });
+        console.log('✅ [CALLBACK] Acknowledged callback receipt');
         
-        // Process payment asynchronously if completed
+        // Process payment if completed
         if (status === 'completed' || status === 'paid' || status === 'success') {
+            console.log('✅ [CALLBACK] Payment is completed! Processing...');
             await processSuccessfulUnlockPayment(transaction_id, {
                 amount: amount,
                 phone: phone,
                 reference: reference,
                 description: description
             });
+        } else {
+            console.log(`⏳ [CALLBACK] Payment status: ${status} - not completed yet`);
         }
+        
     } catch (error) {
-        console.error('❌ Payment callback error:', error);
+        console.error('❌ [CALLBACK] Error processing callback:', error);
         res.status(200).json({ status: 'error', message: error.message });
     }
 });
 
 // ============================================================
-//  PROCESS UNLOCK PAYMENT (100 KES)
+//  PROCESS UNLOCK PAYMENT
 // ============================================================
 
 async function processSuccessfulUnlockPayment(transactionId, data) {
     const { amount, phone, reference, description } = data;
     
-    console.log(`✅ Processing successful unlock payment: ${transactionId}`);
+    console.log(`\n✅ [PROCESS] Processing successful unlock payment: ${transactionId}`);
     console.log(`   Amount: ${amount}, Phone: ${phone}, Ref: ${reference}`);
     
     // Extract hotel ID and client ID from reference: UNLOCK-hotelId-clientId
-    const unlockMatch = reference.match(/UNLOCK-(\d+)-(\d+)/);
+    const unlockMatch = reference?.match(/UNLOCK-(\d+)-(\d+)/);
     if (unlockMatch) {
         const hotelId = parseInt(unlockMatch[1]);
         const clientId = parseInt(unlockMatch[2]);
+        
+        console.log(`   Hotel ID: ${hotelId}, Client ID: ${clientId}`);
         
         try {
             const UNLOCK_EXPIRY_DAYS = 7;
@@ -300,12 +342,14 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
                      WHERE client_id = $3 AND hotel_id = $4`,
                     [expiryDate, transactionId, clientId, hotelId]
                 );
+                console.log('✅ [PROCESS] Updated existing payment record');
             } else {
                 await pool.query(
                     `INSERT INTO payments (client_id, hotel_id, paid, transaction_id, amount, expires_at)
                      VALUES ($1, $2, TRUE, $3, $4, $5)`,
                     [clientId, hotelId, transactionId, 100, expiryDate]
                 );
+                console.log('✅ [PROCESS] Created new payment record');
             }
             
             // Update pending payment status
@@ -314,13 +358,13 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
                 [transactionId]
             );
             
-            console.log(`✅ Unlock payment processed: Hotel ${hotelId}, Client ${clientId}`);
+            console.log(`✅ [PROCESS] Unlock payment completed: Hotel ${hotelId}, Client ${clientId}`);
             
         } catch (error) {
-            console.error('❌ Unlock payment processing error:', error);
+            console.error('❌ [PROCESS] Unlock payment processing error:', error);
         }
     } else {
-        console.log('⚠️ Could not extract hotel/client IDs from reference:', reference);
+        console.log('⚠️ [PROCESS] Could not extract hotel/client IDs from reference:', reference);
     }
 }
 
@@ -329,22 +373,27 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
 // ============================================================
 
 app.post('/api/payments/unlock', async (req, res) => {
+    console.log('\n🚀 [API] Unlock payment request received');
+    console.log('   Body:', JSON.stringify(req.body, null, 2));
+    
     try {
         const { hotel_id, phone } = req.body;
         const token = req.headers.authorization?.split(' ')[1];
         
         if (!token) {
+            console.log('❌ [API] No authorization token');
             return res.status(401).json({ error: 'Please login first' });
         }
         
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
         
-        console.log(`🔓 Unlock request: Client ${clientId}, Hotel ${hotel_id}, Phone ${phone}`);
+        console.log(`   Client ID: ${clientId}, Hotel ID: ${hotel_id}, Phone: ${phone}`);
         
         // Validate phone number
         const cleanPhone = phone.replace(/[^0-9]/g, '');
         if (!cleanPhone || cleanPhone.length < 10) {
+            console.log('❌ [API] Invalid phone number:', phone);
             return res.status(400).json({ error: 'Please enter a valid phone number (e.g., 0712345678)' });
         }
         
@@ -355,6 +404,7 @@ app.post('/api/payments/unlock', async (req, res) => {
         );
         
         if (existing.rows.length > 0) {
+            console.log('✅ [API] User already has access');
             return res.json({
                 success: true,
                 message: 'You already have access to this hotel.',
@@ -363,28 +413,17 @@ app.post('/api/payments/unlock', async (req, res) => {
         }
         
         const reference = `UNLOCK-${hotel_id}-${clientId}`;
-        const description = `Unlock hotel details - ${hotel_id}`;
+        const description = `Unlock hotel ${hotel_id} for client ${clientId}`;
+        
+        console.log('💳 [API] Initiating Tuma payment...');
         
         // Initiate payment with Tuma
         const payment = await initiateTumaPayment(phone, 100, description, reference);
         
-        // Handle mock payment differently
-        if (payment.mock) {
-            console.log('🔧 [MOCK] Payment initiated in mock mode');
-            
-            // Save pending payment
-            await pool.query(
-                `INSERT INTO pending_payments (client_id, hotel_id, amount, reference, transaction_id, status)
-                 VALUES ($1, $2, $3, $4, $5, 'pending')`,
-                [clientId, hotel_id, 100, reference, payment.transaction_id]
-            );
-            
-            return res.json({
-                success: true,
-                message: '[MOCK MODE] Payment initiated. Please check your phone for the M-Pesa prompt.',
-                transaction_id: payment.transaction_id,
-                mock: true,
-                note: 'This is a mock payment for testing. No real money will be charged.'
+        if (!payment.success) {
+            console.log('❌ [API] Payment initiation failed:', payment);
+            return res.status(400).json({ 
+                error: payment.message || 'Payment initiation failed' 
             });
         }
         
@@ -392,8 +431,10 @@ app.post('/api/payments/unlock', async (req, res) => {
         await pool.query(
             `INSERT INTO pending_payments (client_id, hotel_id, amount, reference, transaction_id, status)
              VALUES ($1, $2, $3, $4, $5, 'pending')`,
-            [clientId, hotel_id, 100, reference, payment.transaction_id || 'pending']
+            [clientId, hotel_id, 100, reference, payment.transaction_id]
         );
+        
+        console.log(`✅ [API] Payment initiated successfully! Transaction: ${payment.transaction_id}`);
         
         res.json({
             success: true,
@@ -402,8 +443,11 @@ app.post('/api/payments/unlock', async (req, res) => {
         });
         
     } catch (error) {
-        console.error('❌ Unlock payment error:', error);
-        res.status(500).json({ error: 'Failed to initiate payment: ' + error.message });
+        console.error('❌ [API] Unlock payment error:', error);
+        res.status(500).json({ 
+            error: 'Failed to initiate payment: ' + error.message,
+            details: error.stack
+        });
     }
 });
 
@@ -412,6 +456,8 @@ app.post('/api/payments/unlock', async (req, res) => {
 // ============================================================
 
 app.get('/api/payments/status/:transactionId', async (req, res) => {
+    console.log(`\n🔍 [API] Payment status check: ${req.params.transactionId}`);
+    
     try {
         const { transactionId } = req.params;
         const token = req.headers.authorization?.split(' ')[1];
@@ -430,13 +476,13 @@ app.get('/api/payments/status/:transactionId', async (req, res) => {
         );
         
         if (localResult.rows.length > 0 && localResult.rows[0].status === 'completed') {
+            console.log('✅ [API] Payment already completed in database');
             return res.json({ status: 'completed', paid: true });
         }
         
         // Check with Tuma
-        console.log(`🔍 Checking payment status: ${transactionId}`);
+        console.log('📡 [API] Checking with Tuma...');
         const status = await checkTumaPaymentStatus(transactionId);
-        console.log(`📊 Payment status response:`, status);
         
         if (status.status === 'completed' || status.status === 'paid' || status.status === 'success') {
             // Update local record
@@ -444,18 +490,20 @@ app.get('/api/payments/status/:transactionId', async (req, res) => {
                 'UPDATE pending_payments SET status = $1 WHERE transaction_id = $2',
                 ['completed', transactionId]
             );
+            console.log('✅ [API] Payment status updated to completed');
             return res.json({ status: 'completed', paid: true });
         }
         
+        console.log(`⏳ [API] Payment status: ${status.status || 'pending'}`);
         res.json({ status: status.status || 'pending', paid: false });
         
     } catch (error) {
-        console.error('❌ Payment status check error:', error);
+        console.error('❌ [API] Payment status check error:', error);
         res.status(500).json({ error: 'Failed to check payment status' });
     }
 });
 
- // ============================================================
+// ============================================================
 //  ENSURE ADMIN USER EXISTS
 // ============================================================
 
@@ -467,8 +515,7 @@ app.get('/api/payments/status/:transactionId', async (req, res) => {
         await pool.query(
             `INSERT INTO users (email, password_hash, user_type, full_name, is_verified)
              VALUES ($1, $2, 'admin', 'Super Admin', TRUE)
-             ON CONFLICT (email) DO UPDATE SET password_hash = $2
-             WHERE users.email = $1`,
+             ON CONFLICT (email) DO UPDATE SET password_hash = $2`,
             [adminEmail, hashedPassword]
         );
         console.log('✅ Admin user verified');
@@ -494,11 +541,7 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         const token = jwt.sign(
-            { 
-                id: user.id, 
-                userType: user.user_type,
-                email: user.email 
-            },
+            { id: user.id, userType: user.user_type, email: user.email },
             process.env.JWT_SECRET || 'secret',
             { expiresIn: '30d' }
         );
@@ -526,7 +569,6 @@ app.post('/api/auth/register', async (req, res) => {
         }
 
         const hashedPassword = await bcrypt.hash(password, 10);
-
         const result = await pool.query(
             `INSERT INTO users (email, password_hash, user_type, company_name, full_name, is_verified)
              VALUES ($1, $2, $3, $4, $5, TRUE)
@@ -536,11 +578,7 @@ app.post('/api/auth/register', async (req, res) => {
 
         const user = result.rows[0];
         const token = jwt.sign(
-            { 
-                id: user.id, 
-                userType: user.user_type,
-                email: user.email 
-            },
+            { id: user.id, userType: user.user_type, email: user.email },
             process.env.JWT_SECRET || 'secret',
             { expiresIn: '30d' }
         );
@@ -624,10 +662,6 @@ const isHotelFeatured = async (hotelId) => {
     return expiry > new Date();
 };
 
-// ============================================================
-//  GET ROOM AVAILABILITY
-// ============================================================
-
 async function getRoomAvailability(hotelId, checkInDate, checkOutDate) {
     const roomsResult = await pool.query(
         'SELECT * FROM rooms WHERE hotel_id = $1',
@@ -646,7 +680,6 @@ async function getRoomAvailability(hotelId, checkInDate, checkOutDate) {
              GROUP BY room_type_id`,
             [hotelId, checkOutDate, checkInDate]
         );
-        
         bookingsResult.rows.forEach(b => {
             bookedMap[b.room_type_id] = parseInt(b.booked_count);
         });
@@ -664,10 +697,6 @@ async function getRoomAvailability(hotelId, checkInDate, checkOutDate) {
         };
     });
 }
-
-// ============================================================
-//  GET DATE-SPECIFIC STATISTICS
-// ============================================================
 
 async function getDateSpecificStats(hotelId, date) {
     const targetDate = date || new Date().toISOString().split('T')[0];
@@ -737,7 +766,7 @@ async function getDateSpecificStats(hotelId, date) {
 }
 
 // ============================================================
-//  ADMIN ROUTES
+//  ADMIN ROUTES (Complete)
 // ============================================================
 
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
@@ -936,7 +965,7 @@ app.delete('/api/admin/users/:id', isAdmin, async (req, res) => {
 });
 
 // ============================================================
-//  HOTEL OWNER ROUTES
+//  HOTEL OWNER ROUTES (Complete)
 // ============================================================
 
 app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
@@ -978,35 +1007,6 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
         }
         
         const hotel = result.rows[0];
-
-        const safeHotel = {
-            id: hotel.id,
-            user_id: hotel.user_id,
-            hotel_name: hotel.hotel_name || 'Unnamed Hotel',
-            phone: hotel.phone || '',
-            address: hotel.address || '',
-            city: hotel.city || '',
-            country: hotel.country || '',
-            star_rating: hotel.star_rating || 3,
-            description: hotel.description || '',
-            photos: hotel.photos || [],
-            is_active: hotel.is_active !== undefined ? hotel.is_active : true,
-            subscription_expiry: hotel.subscription_expiry || null,
-            is_featured: hotel.is_featured || false,
-            featured_expiry: hotel.featured_expiry || null,
-            meals: hotel.meals || [],
-            drinks: hotel.drinks || [],
-            whats_new: hotel.whats_new || '',
-            created_at: hotel.created_at || new Date().toISOString(),
-            updated_at: hotel.updated_at || new Date().toISOString()
-        };
-
-        const visible = await isHotelVisible(hotelId);
-        const featured = await isHotelFeatured(hotelId);
-        const daysLeft = safeHotel.subscription_expiry ?
-            Math.max(0, Math.ceil((new Date(safeHotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
-            0;
-
         const today = new Date().toISOString().split('T')[0];
         const stats = await getDateSpecificStats(hotelId, today);
 
@@ -1027,10 +1027,7 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
         );
 
         res.json({
-            ...safeHotel,
-            is_visible: visible,
-            is_featured_active: featured,
-            subscription_days_left: daysLeft,
+            ...hotel,
             room_bookings: roomBookings.rows || [],
             food_orders: foodOrders.rows || [],
             room_stats: {
@@ -1042,13 +1039,9 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
                 date: stats.date
             }
         });
-        
     } catch (error) {
         console.error('❌ Error loading hotel details:', error);
-        res.status(500).json({ 
-            error: 'Failed to load hotel details',
-            message: error.message 
-        });
+        res.status(500).json({ error: 'Failed to load hotel details' });
     }
 });
 
@@ -1181,7 +1174,6 @@ app.get('/api/rooms/public/:hotelId/availability', async (req, res) => {
                  GROUP BY room_type_id`,
                 [hotelId, check_out, check_in]
             );
-            
             bookingsResult.rows.forEach(b => {
                 bookedMap[b.room_type_id] = parseInt(b.booked_count);
             });
@@ -1204,7 +1196,6 @@ app.get('/api/rooms/public/:hotelId/availability', async (req, res) => {
         });
         
         res.json(roomsWithAvailability);
-        
     } catch (error) {
         console.error('Error fetching public room availability:', error);
         res.status(500).json({ error: 'Failed to fetch availability' });
@@ -1404,7 +1395,7 @@ app.get('/api/hotels/:id', async (req, res) => {
 });
 
 // ============================================================
-//  LEGACY PAYMENT ROUTES (Keep for backward compatibility)
+//  LEGACY PAYMENT ROUTES
 // ============================================================
 
 const UNLOCK_PRICE = 100;
@@ -1514,22 +1505,7 @@ app.get('/api/my-bookings', async (req, res) => {
         );
 
         const roomBookings = await pool.query(
-            `SELECT 
-                rb.id,
-                rb.hotel_id,
-                rb.room_type_id,
-                rb.check_in_date,
-                rb.check_out_date,
-                rb.number_of_guests,
-                rb.total_amount,
-                rb.payment_status,
-                rb.status,
-                COALESCE(rb.client_name, 'N/A') as client_name,
-                COALESCE(rb.client_phone, 'N/A') as client_phone,
-                COALESCE(rb.booking_reference, 'N/A') as booking_reference,
-                COALESCE(r.room_type_name, 'Unknown') as room_type_name,
-                COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name,
-                COALESCE(rb.created_at, NOW()) as created_at
+            `SELECT rb.*, COALESCE(r.room_type_name, 'Unknown') as room_type_name, COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
              FROM room_bookings rb
              LEFT JOIN rooms r ON rb.room_type_id = r.id
              LEFT JOIN hotels h ON rb.hotel_id = h.id
@@ -1539,21 +1515,7 @@ app.get('/api/my-bookings', async (req, res) => {
         );
 
         const foodOrders = await pool.query(
-            `SELECT 
-                fo.id,
-                fo.hotel_id,
-                fo.items,
-                fo.total_amount,
-                fo.pickup_date,
-                fo.pickup_time,
-                fo.special_instructions,
-                fo.payment_status,
-                fo.status,
-                COALESCE(fo.client_name, 'N/A') as client_name,
-                COALESCE(fo.client_phone, 'N/A') as client_phone,
-                COALESCE(fo.booking_reference, 'N/A') as booking_reference,
-                COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name,
-                COALESCE(fo.created_at, NOW()) as created_at
+            `SELECT fo.*, COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
              FROM food_orders fo
              LEFT JOIN hotels h ON fo.hotel_id = h.id
              WHERE fo.client_id = $1 AND fo.status = 'confirmed'
@@ -1561,15 +1523,13 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        const parsedFoodOrders = foodOrders.rows.map(o => ({
-            ...o,
-            items: typeof o.items === 'string' ? JSON.parse(o.items) : (o.items || [])
-        }));
-
         res.json({
             unlocked_hotels: unlocked.rows || [],
             room_bookings: roomBookings.rows || [],
-            food_orders: parsedFoodOrders
+            food_orders: foodOrders.rows.map(o => ({
+                ...o,
+                items: typeof o.items === 'string' ? JSON.parse(o.items) : (o.items || [])
+            }))
         });
     } catch (error) {
         console.error('My bookings error:', error);
@@ -1623,7 +1583,6 @@ app.post('/api/food-orders/walk-in', isHotelOwner, async (req, res) => {
              RETURNING *`,
             [hotel_id, client_name, client_phone, JSON.stringify(items), total, pickup_date, pickup_time, special_instructions || '', bookingRef]
         );
-        
         res.status(201).json(result.rows[0]);
     } catch (error) {
         console.error('Walk-in food order error:', error);
@@ -1636,13 +1595,8 @@ app.post('/api/food-orders/:id/confirm-payment', async (req, res) => {
     const { payment_method, payment_reference } = req.body;
     try {
         const result = await pool.query(
-            `UPDATE food_orders SET
-                payment_status = 'paid',
-                payment_method = $1,
-                payment_reference = $2,
-                status = 'confirmed'
-             WHERE id = $3
-             RETURNING *`,
+            `UPDATE food_orders SET payment_status = 'paid', payment_method = $1, payment_reference = $2, status = 'confirmed'
+             WHERE id = $3 RETURNING *`,
             [payment_method, payment_reference, orderId]
         );
         if (result.rows.length === 0) {
@@ -1732,10 +1686,7 @@ app.post('/api/room-bookings/walk-in', isHotelOwner, async (req, res) => {
     try {
         const { hotel_id, room_type_id, check_in_date, check_out_date, number_of_guests, client_name, client_phone, special_requests } = req.body;
         
-        const room = await pool.query(
-            'SELECT * FROM rooms WHERE id = $1',
-            [room_type_id]
-        );
+        const room = await pool.query('SELECT * FROM rooms WHERE id = $1', [room_type_id]);
         if (room.rows.length === 0) {
             return res.status(404).json({ error: 'Room not found' });
         }
@@ -1781,13 +1732,8 @@ app.post('/api/room-bookings/:id/confirm-payment', async (req, res) => {
     const { payment_method, payment_reference } = req.body;
     try {
         const result = await pool.query(
-            `UPDATE room_bookings SET
-                payment_status = 'paid',
-                payment_method = $1,
-                payment_reference = $2,
-                status = 'confirmed'
-             WHERE id = $3
-             RETURNING *`,
+            `UPDATE room_bookings SET payment_status = 'paid', payment_method = $1, payment_reference = $2, status = 'confirmed'
+             WHERE id = $3 RETURNING *`,
             [payment_method, payment_reference, bookingId]
         );
         if (result.rows.length === 0) {
@@ -1939,9 +1885,7 @@ app.put('/api/rooms/:id', isHotelOwner, async (req, res) => {
     
     try {
         const check = await pool.query(
-            `SELECT r.id FROM rooms r
-             JOIN hotels h ON r.hotel_id = h.id
-             WHERE r.id = $1 AND h.user_id = $2`,
+            `SELECT r.id FROM rooms r JOIN hotels h ON r.hotel_id = h.id WHERE r.id = $1 AND h.user_id = $2`,
             [roomId, req.userId]
         );
         if (check.rows.length === 0) {
@@ -1949,14 +1893,9 @@ app.put('/api/rooms/:id', isHotelOwner, async (req, res) => {
         }
 
         const result = await pool.query(
-            `UPDATE rooms SET
-                room_type_name = COALESCE($1, room_type_name),
-                capacity = COALESCE($2, capacity),
-                base_price_per_night = COALESCE($3, base_price_per_night),
-                total_rooms = COALESCE($4, total_rooms),
-                is_available = COALESCE($5, is_available)
-             WHERE id = $6
-             RETURNING *`,
+            `UPDATE rooms SET room_type_name = COALESCE($1, room_type_name), capacity = COALESCE($2, capacity),
+                base_price_per_night = COALESCE($3, base_price_per_night), total_rooms = COALESCE($4, total_rooms),
+                is_available = COALESCE($5, is_available) WHERE id = $6 RETURNING *`,
             [room_type_name, capacity, base_price_per_night, total_rooms, is_available, roomId]
         );
         res.json(result.rows[0]);
@@ -1972,9 +1911,7 @@ app.put('/api/rooms/:id/toggle', isHotelOwner, async (req, res) => {
     
     try {
         const check = await pool.query(
-            `SELECT r.id FROM rooms r
-             JOIN hotels h ON r.hotel_id = h.id
-             WHERE r.id = $1 AND h.user_id = $2`,
+            `SELECT r.id FROM rooms r JOIN hotels h ON r.hotel_id = h.id WHERE r.id = $1 AND h.user_id = $2`,
             [roomId, req.userId]
         );
         if (check.rows.length === 0) {
@@ -1996,9 +1933,7 @@ app.delete('/api/rooms/:id', isHotelOwner, async (req, res) => {
     const roomId = parseInt(req.params.id);
     try {
         const check = await pool.query(
-            `SELECT r.id FROM rooms r
-             JOIN hotels h ON r.hotel_id = h.id
-             WHERE r.id = $1 AND h.user_id = $2`,
+            `SELECT r.id FROM rooms r JOIN hotels h ON r.hotel_id = h.id WHERE r.id = $1 AND h.user_id = $2`,
             [roomId, req.userId]
         );
         if (check.rows.length === 0) {
@@ -2025,9 +1960,7 @@ app.post('/api/conference/:hotelId', isHotelOwner, async (req, res) => {
     const finalPrice = pricePerHour || price_per_hour;
     
     if (!finalRoomName || !capacity || !finalPrice) {
-        return res.status(400).json({ 
-            error: 'Missing required fields. Need: roomName/room_name, capacity, pricePerHour/price_per_hour'
-        });
+        return res.status(400).json({ error: 'Missing required fields' });
     }
 
     try {
@@ -2059,9 +1992,7 @@ app.post('/api/conference', isHotelOwner, async (req, res) => {
     const finalPrice = pricePerHour || price_per_hour;
     
     if (!finalHotelId || !finalRoomName || !capacity || !finalPrice) {
-        return res.status(400).json({ 
-            error: 'Missing required fields. Need: hotel_id, roomName/room_name, capacity, pricePerHour/price_per_hour' 
-        });
+        return res.status(400).json({ error: 'Missing required fields' });
     }
     
     req.params = { hotelId: finalHotelId };
@@ -2088,9 +2019,7 @@ app.put('/api/conference/:id', isHotelOwner, async (req, res) => {
     
     try {
         const check = await pool.query(
-            `SELECT c.id FROM conference_rooms c
-             JOIN hotels h ON c.hotel_id = h.id
-             WHERE c.id = $1 AND h.user_id = $2`,
+            `SELECT c.id FROM conference_rooms c JOIN hotels h ON c.hotel_id = h.id WHERE c.id = $1 AND h.user_id = $2`,
             [roomId, req.userId]
         );
         if (check.rows.length === 0) {
@@ -2098,13 +2027,9 @@ app.put('/api/conference/:id', isHotelOwner, async (req, res) => {
         }
 
         const result = await pool.query(
-            `UPDATE conference_rooms SET
-                room_name = COALESCE($1, room_name),
-                capacity = COALESCE($2, capacity),
-                price_per_hour = COALESCE($3, price_per_hour),
-                amenities = COALESCE($4, amenities)
-             WHERE id = $5
-             RETURNING *`,
+            `UPDATE conference_rooms SET room_name = COALESCE($1, room_name), capacity = COALESCE($2, capacity),
+                price_per_hour = COALESCE($3, price_per_hour), amenities = COALESCE($4, amenities)
+             WHERE id = $5 RETURNING *`,
             [room_name, capacity, price_per_hour, amenities, roomId]
         );
         res.json(result.rows[0]);
@@ -2118,9 +2043,7 @@ app.delete('/api/conference/:id', isHotelOwner, async (req, res) => {
     const roomId = parseInt(req.params.id);
     try {
         const check = await pool.query(
-            `SELECT c.id FROM conference_rooms c
-             JOIN hotels h ON c.hotel_id = h.id
-             WHERE c.id = $1 AND h.user_id = $2`,
+            `SELECT c.id FROM conference_rooms c JOIN hotels h ON c.hotel_id = h.id WHERE c.id = $1 AND h.user_id = $2`,
             [roomId, req.userId]
         );
         if (check.rows.length === 0) {
@@ -2189,9 +2112,7 @@ app.put('/api/menu/:id', isHotelOwner, async (req, res) => {
     
     try {
         const check = await pool.query(
-            `SELECT m.id FROM hotel_menu m
-             JOIN hotels h ON m.hotel_id = h.id
-             WHERE m.id = $1 AND h.user_id = $2`,
+            `SELECT m.id FROM hotel_menu m JOIN hotels h ON m.hotel_id = h.id WHERE m.id = $1 AND h.user_id = $2`,
             [itemId, req.userId]
         );
         if (check.rows.length === 0) {
@@ -2199,14 +2120,9 @@ app.put('/api/menu/:id', isHotelOwner, async (req, res) => {
         }
 
         const result = await pool.query(
-            `UPDATE hotel_menu SET
-                item_name = COALESCE($1, item_name),
-                description = COALESCE($2, description),
-                price = COALESCE($3, price),
-                category = COALESCE($4, category),
-                is_available = COALESCE($5, is_available)
-             WHERE id = $6
-             RETURNING *`,
+            `UPDATE hotel_menu SET item_name = COALESCE($1, item_name), description = COALESCE($2, description),
+                price = COALESCE($3, price), category = COALESCE($4, category), is_available = COALESCE($5, is_available)
+             WHERE id = $6 RETURNING *`,
             [item_name, description, price, category, is_available, itemId]
         );
         res.json(result.rows[0]);
@@ -2220,9 +2136,7 @@ app.delete('/api/menu/:id', isHotelOwner, async (req, res) => {
     const itemId = parseInt(req.params.id);
     try {
         const check = await pool.query(
-            `SELECT m.id FROM hotel_menu m
-             JOIN hotels h ON m.hotel_id = h.id
-             WHERE m.id = $1 AND h.user_id = $2`,
+            `SELECT m.id FROM hotel_menu m JOIN hotels h ON m.hotel_id = h.id WHERE m.id = $1 AND h.user_id = $2`,
             [itemId, req.userId]
         );
         if (check.rows.length === 0) {
@@ -2243,7 +2157,7 @@ app.delete('/api/menu/:id', isHotelOwner, async (req, res) => {
 
 app.post('/api/payments/subscribe/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
-    const { amount, paymentMethod } = req.body;
+    const { amount } = req.body;
     
     try {
         const check = await pool.query(
@@ -2254,50 +2168,41 @@ app.post('/api/payments/subscribe/:hotelId', isHotelOwner, async (req, res) => {
             return res.status(403).json({ error: 'You do not own this hotel' });
         }
 
-        let updateQuery;
-        let expiryDate;
-        let days;
-
+        const days = 30;
+        const expiryDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+        
         if (amount >= 5000) {
-            days = 30;
-            expiryDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-            updateQuery = `UPDATE hotels SET 
-                is_active = TRUE,
-                is_featured = TRUE,
-                featured_expiry = $1,
-                subscription_expiry = $1,
-                updated_at = CURRENT_TIMESTAMP
-                WHERE id = $2`;
+            await pool.query(
+                `UPDATE hotels SET is_active = TRUE, is_featured = TRUE, featured_expiry = $1, subscription_expiry = $1
+                 WHERE id = $2`,
+                [expiryDate, hotelId]
+            );
         } else {
-            days = 30;
-            expiryDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-            updateQuery = `UPDATE hotels SET 
-                is_active = TRUE,
-                subscription_expiry = $1,
-                updated_at = CURRENT_TIMESTAMP
-                WHERE id = $2`;
+            await pool.query(
+                `UPDATE hotels SET is_active = TRUE, subscription_expiry = $1 WHERE id = $2`,
+                [expiryDate, hotelId]
+            );
         }
-
-        await pool.query(updateQuery, [expiryDate, hotelId]);
         
         res.json({
             success: true,
-            message: `✅ Subscription successful! ${amount >= 5000 ? '🌟 Hotel is now FEATURED!' : 'Hotel is now visible.'} Expires in ${days} days.`
+            message: `✅ Subscription successful! ${amount >= 5000 ? '🌟 Hotel is now FEATURED!' : 'Hotel is now visible.'}`
         });
     } catch (error) {
         console.error('Subscription error:', error);
         res.status(500).json({ error: 'Subscription failed: ' + error.message });
-    
+    }
+});
+
 // ============================================================
 //  START SERVER
 // ============================================================
 
 app.listen(port, '0.0.0.0', () => {
-    console.log(`🚀 Server running on port ${port}`);
-    console.log(`👤 Admin: admin@hotelbooking.com / admin123`);
-    console.log(`📱 Payment Mode: ${TUMA_CONFIG.MOCK_MODE ? 'MOCK (Testing)' : 'LIVE'}`);
-    if (TUMA_CONFIG.MOCK_MODE) {
-        console.log('⚠️  MOCK MODE ENABLED - No real payments will be processed');
-        console.log('⚠️  To enable real payments, set TUMA_EMAIL and TUMA_API_KEY');
-    }
+    console.log('\n' + '='.repeat(50));
+    console.log('🚀 SERVER STARTED SUCCESSFULLY!');
+    console.log(`   Port: ${port}`);
+    console.log(`   Admin: admin@hotelbooking.com / admin123`);
+    console.log(`   Payment Mode: ${TUMA_CONFIG.EMAIL && TUMA_CONFIG.API_KEY ? 'LIVE 💰' : '⚠️  NO CREDENTIALS'}`);
+    console.log('='.repeat(50));
 });
