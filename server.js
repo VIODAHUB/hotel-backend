@@ -39,6 +39,7 @@ console.log('   API URL:', TUMA_CONFIG.API_URL);
 console.log('   Email:', TUMA_CONFIG.EMAIL ? '✅ Set' : '❌ MISSING');
 console.log('   API Key:', TUMA_CONFIG.API_KEY ? '✅ Set' : '❌ MISSING');
 console.log('   Callback URL:', TUMA_CONFIG.CALLBACK_URL);
+console.log('   Account: Using MAIN account (no secondary account)');
 console.log('='.repeat(50));
 
 // ============================================================
@@ -107,14 +108,13 @@ async function initiateTumaPayment(phone, amount, description, reference) {
         
         console.log(`   📱 Formatted Phone: ${formattedPhone}`);
         
-        // Tuma API expects 'account' instead of 'reference'
-        // The account field can hold your reference ID
+        // Remove 'account' field entirely - uses main account by default
         const payload = {
             amount: amount,
             phone: formattedPhone,
             callback_url: TUMA_CONFIG.CALLBACK_URL,
-            description: description || 'HotBook Payment',
-            account: reference || 'HOTBOOK-' + Date.now()  // Changed from 'reference' to 'account'
+            description: description || 'HotBook Payment'
+            // NO 'account' field - this uses the main account by default
         };
         
         console.log('   📤 Payment Payload:', JSON.stringify(payload, null, 2));
@@ -136,8 +136,12 @@ async function initiateTumaPayment(phone, amount, description, reference) {
         
         if (!response.ok) {
             console.error(`❌ [TUMA] Payment request failed: ${responseText}`);
-            const errorData = JSON.parse(responseText);
-            throw new Error(errorData.message || `Payment request failed: ${response.status}`);
+            let errorMessage = `Payment request failed: ${response.status}`;
+            try {
+                const errorData = JSON.parse(responseText);
+                errorMessage = errorData.message || errorMessage;
+            } catch (e) {}
+            throw new Error(errorMessage);
         }
         
         const result = JSON.parse(responseText);
@@ -218,7 +222,7 @@ app.post('/api/payment-callback', express.json({ type: 'application/json' }), as
             status, 
             amount, 
             phone, 
-            account,  // Changed from 'reference' to 'account'
+            account,
             description 
         } = req.body;
         
@@ -232,7 +236,7 @@ app.post('/api/payment-callback', express.json({ type: 'application/json' }), as
             await processSuccessfulUnlockPayment(transaction_id, {
                 amount: amount,
                 phone: phone,
-                reference: account,  // Use 'account' as reference
+                reference: account || 'no-account',
                 description: description
             });
         } else {
@@ -255,12 +259,25 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
     console.log(`\n✅ [PROCESS] Processing successful unlock payment: ${transactionId}`);
     console.log(`   Amount: ${amount}, Phone: ${phone}, Ref: ${reference}`);
     
-    // Extract hotel ID and client ID from reference: UNLOCK-hotelId-clientId
-    const unlockMatch = reference?.match(/UNLOCK-(\d+)-(\d+)/);
-    if (unlockMatch) {
-        const hotelId = parseInt(unlockMatch[1]);
-        const clientId = parseInt(unlockMatch[2]);
-        
+    // Extract hotel ID and client ID from the description or reference
+    // Since we removed 'account' field, we need to get the reference from description
+    let hotelId, clientId;
+    
+    // Try to extract from description first (format: "Unlock hotel X for client Y")
+    const descMatch = description?.match(/Unlock hotel (\d+) for client (\d+)/);
+    if (descMatch) {
+        hotelId = parseInt(descMatch[1]);
+        clientId = parseInt(descMatch[2]);
+    } else {
+        // Try the old format from reference
+        const unlockMatch = reference?.match(/UNLOCK-(\d+)-(\d+)/);
+        if (unlockMatch) {
+            hotelId = parseInt(unlockMatch[1]);
+            clientId = parseInt(unlockMatch[2]);
+        }
+    }
+    
+    if (hotelId && clientId) {
         console.log(`   Hotel ID: ${hotelId}, Client ID: ${clientId}`);
         
         try {
@@ -305,7 +322,7 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
             console.error('❌ [PROCESS] Unlock payment processing error:', error);
         }
     } else {
-        console.log('⚠️ [PROCESS] Could not extract hotel/client IDs from reference:', reference);
+        console.log('⚠️ [PROCESS] Could not extract hotel/client IDs. Description:', description);
     }
 }
 
@@ -358,7 +375,7 @@ app.post('/api/payments/unlock', async (req, res) => {
         
         console.log('💳 [API] Initiating Tuma payment...');
         
-        // Initiate payment with Tuma
+        // Initiate payment with Tuma (uses main account automatically)
         const payment = await initiateTumaPayment(phone, 100, description, reference);
         
         if (!payment.success) {
@@ -706,7 +723,7 @@ async function getDateSpecificStats(hotelId, date) {
 }
 
 // ============================================================
-//  ADMIN ROUTES
+//  ADMIN ROUTES (Complete - all your existing routes)
 // ============================================================
 
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
@@ -2144,5 +2161,6 @@ app.listen(port, '0.0.0.0', () => {
     console.log(`   Port: ${port}`);
     console.log(`   Admin: admin@hotelbooking.com / admin123`);
     console.log(`   Payment Mode: ${TUMA_CONFIG.EMAIL && TUMA_CONFIG.API_KEY ? 'LIVE 💰' : '⚠️  NO CREDENTIALS'}`);
+    console.log('   Account: Using MAIN account (no secondary account)');
     console.log('='.repeat(50));
 });
