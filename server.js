@@ -26,77 +26,6 @@ pool.connect((err) => {
 // ============================================================
 
 const TUMA_CONFIG = {
-    API_URL: 'https://api.tuma.co.ke',
-    EMAIL: process.env.TUMA_EMAIL,
-    API_KEY: process.env.TUMA_API_KEY,
-    CALLBACK_URL: process.env.TUMA_CALLBACK_URL || 'https://hotel-backend-s79n.onrender.com/api/payment-callback',
-    TIMEOUT: 30000
-};
-
-// Validate Tuma credentials
-if (!TUMA_CONFIG.EMAIL || !TUMA_CONFIG.API_KEY) {
-    console.error('❌ Missing Tuma credentials! Please check your environment variables.');
-    console.error('   TUMA_EMAIL:', TUMA_CONFIG.EMAIL ? '✅ Set' : '❌ Missing');
-    console.error('   TUMA_API_KEY:', TUMA_CONFIG.API_KEY ? '✅ Set' : '❌ Missing');
-    // Don't exit, just warn - allow server to start for other features
-} else {
-    console.log('✅ Tuma credentials loaded successfully');
-}
-
-// ============================================================
-//  TUMA API HELPER FUNCTIONS
-// ============================================================
-
-async function getTumaToken() {
-    try {
-        console.log('🔑 Getting Tuma token...');
-        const response = await fetch(`${TUMA_CONFIG.API_URL}/auth/token`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                email: TUMA_CONFIG.EMAIL,
-                api_key: TUMA_CONFIG.API_KEY
-            })
-        });
-        
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('❌ Tuma token error response:', errorText);
-            throw new Error(`Failed to get Tuma token: ${response.status}`);
-        }
-        
-        const data = await response.json();
-        console.log('✅ Tuma token obtained successfully');
-        return data.token;
-    } catch (error) {
-        console.error('❌ Tuma token error:', error);
-        throw error;
-    }
-}
-
-async function initiateTumaPayment(phone, amount, description, reference) {
-    try {
-        const token = await getTumaToken();
-        
-        // Format phone number for Tuma (254XXXXXXXXX)
-        const cleanPhone = phone.replace(/[^0-9]/g, '');
-        const formattedPhone = cleanPhone.startsWith('0') ? '254' + cleanPhone.slice(1) : 
-                              cleanPhone.startsWith('254') ? cleanPhone : '254' + cleanPhone;
-        
-        const payload = {
-            amount: amount,
-            phone: formattedPhone,
-            callback_url: TUMA_CONFIG.CALLBACK_URL,
-            description: description || 'HotBook Payment',
-            reference: reference || 'HOTBOOK-' + Date.now()
-        };
-        
-        console.log('📤 Sending Tuma payment payload:', payload);
-// ============================================================
-//  TUMA PAYMENT CONFIGURATION
-// ============================================================
-
-const TUMA_CONFIG = {
     API_URL: process.env.TUMA_API_URL || 'https://api.tuma.co.ke',
     EMAIL: process.env.TUMA_EMAIL,
     API_KEY: process.env.TUMA_API_KEY,
@@ -207,6 +136,37 @@ async function initiateTumaPayment(phone, amount, description, reference) {
         throw error;
     }
 }
+
+async function checkTumaPaymentStatus(transactionId) {
+    try {
+        const token = await getTumaToken();
+        console.log(`🔍 Checking payment status for: ${transactionId}`);
+        
+        const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/status/${transactionId}`, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+        });
+        
+        const responseText = await response.text();
+        console.log('📄 Status response:', responseText.substring(0, 500));
+        
+        if (!response.ok) {
+            console.error('❌ Status check failed:', response.status, responseText);
+            return { status: 'pending', paid: false };
+        }
+        
+        const result = JSON.parse(responseText);
+        return result;
+    } catch (error) {
+        console.error('❌ Tuma status check error:', error.message);
+        return { status: 'pending', paid: false };
+    }
+}
+
 // ============================================================
 //  PAYMENT CALLBACK WEBHOOK
 // ============================================================
