@@ -940,7 +940,305 @@ app.get('/api/hotels/:id/access', async (req, res) => {
         res.json({ hasAccess: false });
     }
 });
+// ============================================================
+//  TUMA PAYMENT CONFIGURATION - Add this to your server.js
+// ============================================================
 
+// Add these at the top of your server.js with other requires
+const TUMA_CONFIG = {
+    API_URL: 'https://api.tuma.co.ke',
+    EMAIL: 'violetmiswa2020@gmail.com',  // ← REPLACE WITH YOUR TUMA EMAIL
+    API_KEY: 'tuma_20433f9d9c1311d6051511882d85bee42a0a774572f0c687d12c8ed0c22012f1_1788772280',      // ← REPLACE WITH YOUR TUMA API KEY
+    CALLBACK_URL: 'https://yourdomain.com/api/payment-callback', // Will update with ngrok URL
+    TIMEOUT: 30000
+};
+
+// ===== TUMA API HELPER FUNCTIONS =====
+async function getTumaToken() {
+    try {
+        console.log('🔑 Getting Tuma token...');
+        const response = await fetch(`${TUMA_CONFIG.API_URL}/auth/token`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                email: TUMA_CONFIG.EMAIL,
+                api_key: TUMA_CONFIG.API_KEY
+            })
+        });
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('❌ Tuma token error response:', errorText);
+            throw new Error(`Failed to get Tuma token: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        console.log('✅ Tuma token obtained successfully');
+        return data.token;
+    } catch (error) {
+        console.error('❌ Tuma token error:', error);
+        throw error;
+    }
+}
+
+async function initiateTumaPayment(phone, amount, description, reference) {
+    try {
+        const token = await getTumaToken();
+        
+        // Format phone number for Tuma (254XXXXXXXXX)
+        const cleanPhone = phone.replace(/[^0-9]/g, '');
+        const formattedPhone = cleanPhone.startsWith('0') ? '254' + cleanPhone.slice(1) : 
+                              cleanPhone.startsWith('254') ? cleanPhone : '254' + cleanPhone;
+        
+        const payload = {
+            amount: amount,
+            phone: formattedPhone,
+            callback_url: TUMA_CONFIG.CALLBACK_URL,
+            description: description || 'HotBook Payment',
+            reference: reference || 'HOTBOOK-' + Date.now()
+        };
+        
+        console.log('📤 Sending Tuma payment payload:', payload);
+        
+        const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/stk-push`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+        
+        const result = await response.json();
+        console.log('📥 Tuma payment response:', result);
+        
+        return result;
+    } catch (error) {
+        console.error('❌ Tuma payment error:', error);
+        throw error;
+    }
+}
+
+async function checkTumaPaymentStatus(transactionId) {
+    try {
+        const token = await getTumaToken();
+        
+        const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/status/${transactionId}`, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        const result = await response.json();
+        return result;
+    } catch (error) {
+        console.error('❌ Tuma status check error:', error);
+        throw error;
+    }
+}
+
+// ===== PAYMENT CALLBACK WEBHOOK =====
+app.post('/api/payment-callback', express.json({ type: 'application/json' }), async (req, res) => {
+    console.log('📥 Payment callback received:', req.body);
+    
+    try {
+        const { 
+            transaction_id, 
+            status, 
+            amount, 
+            phone, 
+            reference,
+            description 
+        } = req.body;
+        
+        // Always respond immediately to Tuma
+        res.status(200).json({ status: 'received' });
+        
+        // Process payment asynchronously if completed
+        if (status === 'completed' || status === 'paid') {
+            await processSuccessfulUnlockPayment(transaction_id, {
+                amount: amount,
+                phone: phone,
+                reference: reference,
+                description: description
+            });
+        }
+    } catch (error) {
+        console.error('❌ Payment callback error:', error);
+        res.status(200).json({ status: 'error', message: error.message });
+    }
+});
+
+// ===== PROCESS UNLOCK PAYMENT (100 KES) =====
+async function processSuccessfulUnlockPayment(transactionId, data) {
+    const { amount, phone, reference, description } = data;
+    
+    console.log(`✅ Processing successful unlock payment: ${transactionId}`);
+    console.log(`   Amount: ${amount}, Phone: ${phone}, Ref: ${reference}`);
+    
+    // Extract hotel ID and client ID from reference: UNLOCK-hotelId-clientId
+    const unlockMatch = reference.match(/UNLOCK-(\d+)-(\d+)/);
+    if (unlockMatch) {
+        const hotelId = parseInt(unlockMatch[1]);
+        const clientId = parseInt(unlockMatch[2]);
+        
+        try {
+            const UNLOCK_EXPIRY_DAYS = 7;
+            const expiryDate = new Date(Date.now() + UNLOCK_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+            
+            // Check if payment already exists
+            const existing = await pool.query(
+                'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2',
+                [clientId, hotelId]
+            );
+            
+            if (existing.rows.length > 0) {
+                await pool.query(
+                    `UPDATE payments SET 
+                        paid = TRUE, 
+                        expires_at = $1,
+                        transaction_id = $2,
+                        updated_at = CURRENT_TIMESTAMP
+                     WHERE client_id = $3 AND hotel_id = $4`,
+                    [expiryDate, transactionId, clientId, hotelId]
+                );
+            } else {
+                await pool.query(
+                    `INSERT INTO payments (client_id, hotel_id, paid, transaction_id, amount, expires_at)
+                     VALUES ($1, $2, TRUE, $3, $4, $5)`,
+                    [clientId, hotelId, transactionId, 100, expiryDate]
+                );
+            }
+            
+            // Update pending payment status
+            await pool.query(
+                `UPDATE pending_payments SET status = 'completed' WHERE transaction_id = $1`,
+                [transactionId]
+            );
+            
+            console.log(`✅ Unlock payment processed: Hotel ${hotelId}, Client ${clientId}`);
+            
+            // Optional: Send notification to client
+            console.log(`🔔 Access granted for client ${clientId} to hotel ${hotelId}`);
+        } catch (error) {
+            console.error('❌ Unlock payment processing error:', error);
+        }
+    } else {
+        console.log('⚠️ Could not extract hotel/client IDs from reference:', reference);
+    }
+}
+// ===== INITIATE UNLOCK PAYMENT =====
+app.post('/api/payments/unlock', async (req, res) => {
+    try {
+        const { hotel_id, phone } = req.body;
+        const token = req.headers.authorization?.split(' ')[1];
+        
+        if (!token) {
+            return res.status(401).json({ error: 'Please login first' });
+        }
+        
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+        const clientId = decoded.id;
+        
+        console.log(`🔓 Unlock request: Client ${clientId}, Hotel ${hotel_id}, Phone ${phone}`);
+        
+        // Validate phone number
+        const cleanPhone = phone.replace(/[^0-9]/g, '');
+        if (!cleanPhone || cleanPhone.length < 10) {
+            return res.status(400).json({ error: 'Please enter a valid phone number (e.g., 0712345678)' });
+        }
+        
+        // Check if already paid
+        const existing = await pool.query(
+            'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2 AND paid = TRUE AND expires_at > NOW()',
+            [clientId, hotel_id]
+        );
+        
+        if (existing.rows.length > 0) {
+            return res.json({
+                success: true,
+                message: 'You already have access to this hotel.',
+                already_paid: true
+            });
+        }
+        
+        const reference = `UNLOCK-${hotel_id}-${clientId}`;
+        const description = `Unlock hotel details - ${hotel_id}`;
+        
+        // Initiate payment with Tuma
+        const payment = await initiateTumaPayment(phone, 100, description, reference);
+        
+        if (!payment.success && payment.error) {
+            return res.status(400).json({ 
+                error: payment.error || 'Payment initiation failed' 
+            });
+        }
+        
+        // Save pending payment
+        await pool.query(
+            `INSERT INTO pending_payments (client_id, hotel_id, amount, reference, transaction_id, status)
+             VALUES ($1, $2, $3, $4, $5, 'pending')`,
+            [clientId, hotel_id, 100, reference, payment.transaction_id || 'pending']
+        );
+        
+        res.json({
+            success: true,
+            message: 'Payment initiated. Please check your phone for the M-Pesa prompt.',
+            transaction_id: payment.transaction_id
+        });
+        
+    } catch (error) {
+        console.error('❌ Unlock payment error:', error);
+        res.status(500).json({ error: 'Failed to initiate payment: ' + error.message });
+    }
+});
+
+// ===== CHECK PAYMENT STATUS =====
+app.get('/api/payments/status/:transactionId', async (req, res) => {
+    try {
+        const { transactionId } = req.params;
+        const token = req.headers.authorization?.split(' ')[1];
+        
+        if (!token) {
+            return res.status(401).json({ error: 'Please login first' });
+        }
+        
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+        const clientId = decoded.id;
+        
+        // Check local database first
+        const localResult = await pool.query(
+            'SELECT * FROM pending_payments WHERE transaction_id = $1 AND client_id = $2',
+            [transactionId, clientId]
+        );
+        
+        if (localResult.rows.length > 0 && localResult.rows[0].status === 'completed') {
+            return res.json({ status: 'completed', paid: true });
+        }
+        
+        // Check with Tuma
+        console.log(`🔍 Checking payment status: ${transactionId}`);
+        const status = await checkTumaPaymentStatus(transactionId);
+        console.log(`📊 Payment status response:`, status);
+        
+        if (status.status === 'completed' || status.status === 'paid') {
+            // Update local record
+            await pool.query(
+                'UPDATE pending_payments SET status = $1 WHERE transaction_id = $2',
+                ['completed', transactionId]
+            );
+            return res.json({ status: 'completed', paid: true });
+        }
+        
+        res.json({ status: status.status || 'pending', paid: false });
+        
+    } catch (error) {
+        console.error('❌ Payment status check error:', error);
+        res.status(500).json({ error: 'Failed to check payment status' });
+    }
+});
 // ===== MY BOOKINGS =====
 app.get('/api/my-bookings', async (req, res) => {
     try {
