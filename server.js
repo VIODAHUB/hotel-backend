@@ -944,14 +944,24 @@ app.get('/api/hotels/:id/access', async (req, res) => {
 //  TUMA PAYMENT CONFIGURATION - Add this to your server.js
 // ============================================================
 
-// Add these at the top of your server.js with other requires
+// server.js - Tuma configuration using environment variables
 const TUMA_CONFIG = {
     API_URL: 'https://api.tuma.co.ke',
-    EMAIL: 'violetmiswa2020@gmail.com',  // ← REPLACE WITH YOUR TUMA EMAIL
-    API_KEY: 'tuma_20433f9d9c1311d6051511882d85bee42a0a774572f0c687d12c8ed0c22012f1_1788772280',      // ← REPLACE WITH YOUR TUMA API KEY
-    CALLBACK_URL: 'https://yourdomain.com/api/payment-callback', // Will update with ngrok URL
+    EMAIL: process.env.TUMA_EMAIL,
+    API_KEY: process.env.TUMA_API_KEY,
+    CALLBACK_URL: process.env.TUMA_CALLBACK_URL || 'https://yourdomain.com/api/payment-callback',
     TIMEOUT: 30000
 };
+
+// Add validation to ensure variables exist
+if (!TUMA_CONFIG.EMAIL || !TUMA_CONFIG.API_KEY) {
+    console.error('❌ Missing Tuma credentials! Please check your environment variables.');
+    console.error('   TUMA_EMAIL:', TUMA_CONFIG.EMAIL ? '✅ Set' : '❌ Missing');
+    console.error('   TUMA_API_KEY:', TUMA_CONFIG.API_KEY ? '✅ Set' : '❌ Missing');
+    process.exit(1);
+} else {
+    console.log('✅ Tuma credentials loaded successfully');
+}
 
 // ===== TUMA API HELPER FUNCTIONS =====
 async function getTumaToken() {
