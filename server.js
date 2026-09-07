@@ -39,7 +39,6 @@ console.log('   API URL:', TUMA_CONFIG.API_URL);
 console.log('   Email:', TUMA_CONFIG.EMAIL ? '✅ Set' : '❌ MISSING');
 console.log('   API Key:', TUMA_CONFIG.API_KEY ? '✅ Set' : '❌ MISSING');
 console.log('   Callback URL:', TUMA_CONFIG.CALLBACK_URL);
-console.log('   Account: Using MAIN account (no secondary account)');
 console.log('='.repeat(50));
 
 // ============================================================
@@ -95,7 +94,6 @@ async function initiateTumaPayment(phone, amount, description, reference) {
     try {
         const token = await getTumaToken();
         
-        // Format phone number for Tuma (254XXXXXXXXX)
         const cleanPhone = phone.replace(/[^0-9]/g, '');
         let formattedPhone;
         if (cleanPhone.startsWith('0')) {
@@ -108,13 +106,11 @@ async function initiateTumaPayment(phone, amount, description, reference) {
         
         console.log(`   📱 Formatted Phone: ${formattedPhone}`);
         
-        // Remove 'account' field entirely - uses main account by default
         const payload = {
             amount: amount,
             phone: formattedPhone,
             callback_url: TUMA_CONFIG.CALLBACK_URL,
             description: description || 'HotBook Payment'
-            // NO 'account' field - this uses the main account by default
         };
         
         console.log('   📤 Payment Payload:', JSON.stringify(payload, null, 2));
@@ -147,7 +143,6 @@ async function initiateTumaPayment(phone, amount, description, reference) {
         const result = JSON.parse(responseText);
         console.log('   ✅ Payment Response:', JSON.stringify(result, null, 2));
         
-        // Extract transaction ID from response
         const transactionId = result.transaction_id || 
                              result.data?.transaction_id || 
                              result.id || 
@@ -226,11 +221,9 @@ app.post('/api/payment-callback', express.json({ type: 'application/json' }), as
             description 
         } = req.body;
         
-        // Always respond immediately to Tuma
         res.status(200).json({ status: 'received' });
         console.log('✅ [CALLBACK] Acknowledged callback receipt');
         
-        // Process payment if completed
         if (status === 'completed' || status === 'paid' || status === 'success') {
             console.log('✅ [CALLBACK] Payment is completed! Processing...');
             await processSuccessfulUnlockPayment(transaction_id, {
@@ -259,17 +252,13 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
     console.log(`\n✅ [PROCESS] Processing successful unlock payment: ${transactionId}`);
     console.log(`   Amount: ${amount}, Phone: ${phone}, Ref: ${reference}`);
     
-    // Extract hotel ID and client ID from the description or reference
-    // Since we removed 'account' field, we need to get the reference from description
     let hotelId, clientId;
     
-    // Try to extract from description first (format: "Unlock hotel X for client Y")
     const descMatch = description?.match(/Unlock hotel (\d+) for client (\d+)/);
     if (descMatch) {
         hotelId = parseInt(descMatch[1]);
         clientId = parseInt(descMatch[2]);
     } else {
-        // Try the old format from reference
         const unlockMatch = reference?.match(/UNLOCK-(\d+)-(\d+)/);
         if (unlockMatch) {
             hotelId = parseInt(unlockMatch[1]);
@@ -284,7 +273,6 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
             const UNLOCK_EXPIRY_DAYS = 7;
             const expiryDate = new Date(Date.now() + UNLOCK_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
             
-            // Check if payment already exists
             const existing = await pool.query(
                 'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2',
                 [clientId, hotelId]
@@ -310,7 +298,6 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
                 console.log('✅ [PROCESS] Created new payment record');
             }
             
-            // Update pending payment status
             await pool.query(
                 `UPDATE pending_payments SET status = 'completed' WHERE transaction_id = $1`,
                 [transactionId]
@@ -348,14 +335,12 @@ app.post('/api/payments/unlock', async (req, res) => {
         
         console.log(`   Client ID: ${clientId}, Hotel ID: ${hotel_id}, Phone: ${phone}`);
         
-        // Validate phone number
         const cleanPhone = phone.replace(/[^0-9]/g, '');
         if (!cleanPhone || cleanPhone.length < 10) {
             console.log('❌ [API] Invalid phone number:', phone);
             return res.status(400).json({ error: 'Please enter a valid phone number (e.g., 0712345678)' });
         }
         
-        // Check if already paid
         const existing = await pool.query(
             'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2 AND paid = TRUE AND expires_at > NOW()',
             [clientId, hotel_id]
@@ -375,7 +360,6 @@ app.post('/api/payments/unlock', async (req, res) => {
         
         console.log('💳 [API] Initiating Tuma payment...');
         
-        // Initiate payment with Tuma (uses main account automatically)
         const payment = await initiateTumaPayment(phone, 100, description, reference);
         
         if (!payment.success) {
@@ -385,7 +369,6 @@ app.post('/api/payments/unlock', async (req, res) => {
             });
         }
         
-        // Save pending payment
         await pool.query(
             `INSERT INTO pending_payments (client_id, hotel_id, amount, reference, transaction_id, status)
              VALUES ($1, $2, $3, $4, $5, 'pending')`,
@@ -426,7 +409,6 @@ app.get('/api/payments/status/:transactionId', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
         
-        // Check local database first
         const localResult = await pool.query(
             'SELECT * FROM pending_payments WHERE transaction_id = $1 AND client_id = $2',
             [transactionId, clientId]
@@ -437,12 +419,10 @@ app.get('/api/payments/status/:transactionId', async (req, res) => {
             return res.json({ status: 'completed', paid: true });
         }
         
-        // Check with Tuma
         console.log('📡 [API] Checking with Tuma...');
         const status = await checkTumaPaymentStatus(transactionId);
         
         if (status.status === 'completed' || status.status === 'paid' || status.status === 'success') {
-            // Update local record
             await pool.query(
                 'UPDATE pending_payments SET status = $1 WHERE transaction_id = $2',
                 ['completed', transactionId]
@@ -723,7 +703,7 @@ async function getDateSpecificStats(hotelId, date) {
 }
 
 // ============================================================
-//  ADMIN ROUTES (Complete - all your existing routes)
+//  ADMIN ROUTES
 // ============================================================
 
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
@@ -983,8 +963,13 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
+        const daysLeft = hotel.subscription_expiry ?
+            Math.max(0, Math.ceil((new Date(hotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
+            0;
+
         res.json({
             ...hotel,
+            subscription_days_left: daysLeft,
             room_bookings: roomBookings.rows || [],
             food_orders: foodOrders.rows || [],
             room_stats: {
@@ -1073,6 +1058,96 @@ app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
     } catch (error) {
         console.error('Create hotel error:', error);
         res.status(500).json({ error: 'Failed to create hotel: ' + error.message });
+    }
+});
+
+// ============================================================
+//  SUBSCRIPTION - FIXED
+// ============================================================
+
+app.post('/api/payments/subscribe/:hotelId', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    const { amount } = req.body;
+    
+    console.log(`📝 Subscription request: Hotel ${hotelId}, Amount: ${amount}`);
+    
+    try {
+        // Check if user owns this hotel
+        const check = await pool.query(
+            'SELECT id, subscription_expiry FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this hotel' });
+        }
+
+        const currentExpiry = check.rows[0].subscription_expiry;
+        const now = new Date();
+        
+        // Calculate new expiry date (30 days from now OR extend existing)
+        const days = 30;
+        let expiryDate;
+        
+        // If there's an existing expiry date that's in the future, extend from there
+        if (currentExpiry && new Date(currentExpiry) > now) {
+            expiryDate = new Date(currentExpiry);
+            expiryDate.setDate(expiryDate.getDate() + days);
+            console.log(`📅 Extending subscription from ${currentExpiry} to ${expiryDate}`);
+        } else {
+            expiryDate = new Date(now);
+            expiryDate.setDate(expiryDate.getDate() + days);
+            console.log(`📅 New subscription from ${now} to ${expiryDate}`);
+        }
+        
+        // Featured subscription (5000 KES) - adds featured status + subscription
+        if (amount >= 5000) {
+            const featuredExpiry = new Date(expiryDate);
+            await pool.query(
+                `UPDATE hotels SET 
+                    is_active = TRUE,
+                    subscription_expiry = $1,
+                    is_featured = TRUE,
+                    featured_expiry = $2,
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $3`,
+                [expiryDate, featuredExpiry, hotelId]
+            );
+            console.log(`✅ Featured subscription activated for hotel ${hotelId}`);
+            
+            res.json({
+                success: true,
+                message: `✅ Subscription successful! 🌟 Hotel is now FEATURED for 30 days!`,
+                expiry_date: expiryDate,
+                featured: true
+            });
+        } 
+        // Regular subscription (1000 KES)
+        else if (amount >= 1000) {
+            await pool.query(
+                `UPDATE hotels SET 
+                    is_active = TRUE,
+                    subscription_expiry = $1,
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $2`,
+                [expiryDate, hotelId]
+            );
+            console.log(`✅ Subscription activated for hotel ${hotelId}`);
+            
+            res.json({
+                success: true,
+                message: `✅ Subscription successful! Hotel is visible for 30 days.`,
+                expiry_date: expiryDate,
+                featured: false
+            });
+        } else {
+            return res.status(400).json({ 
+                error: 'Invalid subscription amount. Minimum is 1000 KES.' 
+            });
+        }
+        
+    } catch (error) {
+        console.error('❌ Subscription error:', error);
+        res.status(500).json({ error: 'Subscription failed: ' + error.message });
     }
 });
 
@@ -2109,49 +2184,6 @@ app.delete('/api/menu/:id', isHotelOwner, async (req, res) => {
 });
 
 // ============================================================
-//  SUBSCRIPTION
-// ============================================================
-
-app.post('/api/payments/subscribe/:hotelId', isHotelOwner, async (req, res) => {
-    const hotelId = parseInt(req.params.hotelId);
-    const { amount } = req.body;
-    
-    try {
-        const check = await pool.query(
-            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
-            [hotelId, req.userId]
-        );
-        if (check.rows.length === 0) {
-            return res.status(403).json({ error: 'You do not own this hotel' });
-        }
-
-        const days = 30;
-        const expiryDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-        
-        if (amount >= 5000) {
-            await pool.query(
-                `UPDATE hotels SET is_active = TRUE, is_featured = TRUE, featured_expiry = $1, subscription_expiry = $1
-                 WHERE id = $2`,
-                [expiryDate, hotelId]
-            );
-        } else {
-            await pool.query(
-                `UPDATE hotels SET is_active = TRUE, subscription_expiry = $1 WHERE id = $2`,
-                [expiryDate, hotelId]
-            );
-        }
-        
-        res.json({
-            success: true,
-            message: `✅ Subscription successful! ${amount >= 5000 ? '🌟 Hotel is now FEATURED!' : 'Hotel is now visible.'}`
-        });
-    } catch (error) {
-        console.error('Subscription error:', error);
-        res.status(500).json({ error: 'Subscription failed: ' + error.message });
-    }
-});
-
-// ============================================================
 //  START SERVER
 // ============================================================
 
@@ -2161,6 +2193,5 @@ app.listen(port, '0.0.0.0', () => {
     console.log(`   Port: ${port}`);
     console.log(`   Admin: admin@hotelbooking.com / admin123`);
     console.log(`   Payment Mode: ${TUMA_CONFIG.EMAIL && TUMA_CONFIG.API_KEY ? 'LIVE 💰' : '⚠️  NO CREDENTIALS'}`);
-    console.log('   Account: Using MAIN account (no secondary account)');
     console.log('='.repeat(50));
 });
