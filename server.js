@@ -92,46 +92,121 @@ async function initiateTumaPayment(phone, amount, description, reference) {
         };
         
         console.log('📤 Sending Tuma payment payload:', payload);
+// ============================================================
+//  TUMA PAYMENT CONFIGURATION
+// ============================================================
+
+const TUMA_CONFIG = {
+    API_URL: process.env.TUMA_API_URL || 'https://api.tuma.co.ke',
+    EMAIL: process.env.TUMA_EMAIL,
+    API_KEY: process.env.TUMA_API_KEY,
+    CALLBACK_URL: process.env.TUMA_CALLBACK_URL || 'https://hotel-backend-s79n.onrender.com/api/payment-callback',
+    TIMEOUT: 30000
+};
+
+// Validate Tuma credentials
+if (!TUMA_CONFIG.EMAIL || !TUMA_CONFIG.API_KEY) {
+    console.error('❌ Missing Tuma credentials! Please check your environment variables.');
+    console.error('   TUMA_EMAIL:', TUMA_CONFIG.EMAIL ? '✅ Set' : '❌ Missing');
+    console.error('   TUMA_API_KEY:', TUMA_CONFIG.API_KEY ? '✅ Set' : '❌ Missing');
+} else {
+    console.log('✅ Tuma credentials loaded successfully');
+    console.log('📧 Tuma Email:', TUMA_CONFIG.EMAIL);
+}
+
+// ============================================================
+//  TUMA API HELPER FUNCTIONS
+// ============================================================
+
+async function getTumaToken() {
+    try {
+        console.log('🔑 Getting Tuma token...');
+        console.log('📧 Using email:', TUMA_CONFIG.EMAIL);
+        
+        const response = await fetch(`${TUMA_CONFIG.API_URL}/auth/token`, {
+            method: 'POST',
+            headers: { 
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            body: JSON.stringify({
+                email: TUMA_CONFIG.EMAIL,
+                api_key: TUMA_CONFIG.API_KEY
+            })
+        });
+        
+        const responseText = await response.text();
+        console.log('📄 Auth response status:', response.status);
+        console.log('📄 Auth response:', responseText.substring(0, 500));
+        
+        if (!response.ok) {
+            console.error('❌ Tuma auth failed:', response.status, responseText);
+            throw new Error(`Tuma auth failed: ${response.status} - ${responseText}`);
+        }
+        
+        const data = JSON.parse(responseText);
+        
+        if (!data.token) {
+            console.error('❌ No token in response:', data);
+            throw new Error('No token received from Tuma');
+        }
+        
+        console.log('✅ Tuma token obtained successfully');
+        return data.token;
+    } catch (error) {
+        console.error('❌ Tuma token error:', error.message);
+        throw error;
+    }
+}
+
+async function initiateTumaPayment(phone, amount, description, reference) {
+    try {
+        const token = await getTumaToken();
+        console.log('✅ Token obtained, initiating payment...');
+        
+        // Format phone number for Tuma (254XXXXXXXXX)
+        const cleanPhone = phone.replace(/[^0-9]/g, '');
+        const formattedPhone = cleanPhone.startsWith('0') ? '254' + cleanPhone.slice(1) : 
+                              cleanPhone.startsWith('254') ? cleanPhone : '254' + cleanPhone;
+        
+        const payload = {
+            amount: amount,
+            phone: formattedPhone,
+            callback_url: TUMA_CONFIG.CALLBACK_URL,
+            description: description || 'HotBook Payment',
+            reference: reference || 'HOTBOOK-' + Date.now()
+        };
+        
+        console.log('📤 Sending Tuma payment payload:', { ...payload, phone: formattedPhone });
         
         const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/stk-push`, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
             },
             body: JSON.stringify(payload)
         });
         
-        const result = await response.json();
-        console.log('📥 Tuma payment response:', result);
+        const responseText = await response.text();
+        console.log('📄 Payment response status:', response.status);
+        console.log('📄 Payment response:', responseText.substring(0, 500));
+        
+        if (!response.ok) {
+            console.error('❌ Payment request failed:', response.status, responseText);
+            throw new Error(`Payment request failed: ${response.status} - ${responseText}`);
+        }
+        
+        const result = JSON.parse(responseText);
+        console.log('📥 Tuma payment result:', result);
         
         return result;
     } catch (error) {
-        console.error('❌ Tuma payment error:', error);
+        console.error('❌ Tuma payment error:', error.message);
         throw error;
     }
 }
-
-async function checkTumaPaymentStatus(transactionId) {
-    try {
-        const token = await getTumaToken();
-        
-        const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/status/${transactionId}`, {
-            method: 'GET',
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json'
-            }
-        });
-        
-        const result = await response.json();
-        return result;
-    } catch (error) {
-        console.error('❌ Tuma status check error:', error);
-        throw error;
-    }
-}
-
 // ============================================================
 //  PAYMENT CALLBACK WEBHOOK
 // ============================================================
