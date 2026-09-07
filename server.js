@@ -22,7 +22,7 @@ pool.connect((err) => {
 });
 
 // ============================================================
-//  TUMA PAYMENT CONFIGURATION - REAL MODE
+//  TUMA PAYMENT CONFIGURATION
 // ============================================================
 
 const TUMA_CONFIG = {
@@ -37,88 +37,50 @@ console.log('='.repeat(50));
 console.log('📋 TUMA PAYMENT CONFIGURATION:');
 console.log('   API URL:', TUMA_CONFIG.API_URL);
 console.log('   Email:', TUMA_CONFIG.EMAIL ? '✅ Set' : '❌ MISSING');
-console.log('   API Key:', TUMA_CONFIG.API_KEY ? '✅ Set (' + TUMA_CONFIG.API_KEY.substring(0, 10) + '...)' : '❌ MISSING');
+console.log('   API Key:', TUMA_CONFIG.API_KEY ? '✅ Set' : '❌ MISSING');
 console.log('   Callback URL:', TUMA_CONFIG.CALLBACK_URL);
 console.log('='.repeat(50));
 
-// Validate Tuma credentials
-if (!TUMA_CONFIG.EMAIL || !TUMA_CONFIG.API_KEY) {
-    console.error('❌ CRITICAL: Missing Tuma credentials!');
-    console.error('   Please set TUMA_EMAIL and TUMA_API_KEY environment variables.');
-    console.error('   The server will start but payment will fail.');
-}
-
 // ============================================================
-//  TUMA API HELPER FUNCTIONS - WITH EXTENSIVE LOGGING
+//  TUMA API HELPER FUNCTIONS
 // ============================================================
 
 async function getTumaToken() {
     console.log('\n🔑 [TUMA] Getting authentication token...');
-    console.log(`   📧 Email: ${TUMA_CONFIG.EMAIL}`);
-    console.log(`   🔗 URL: ${TUMA_CONFIG.API_URL}/auth/token`);
     
     try {
-        const requestBody = {
-            email: TUMA_CONFIG.EMAIL,
-            api_key: TUMA_CONFIG.API_KEY
-        };
-        
-        console.log('   📤 Request Body:', JSON.stringify(requestBody, null, 2));
-        
         const response = await fetch(`${TUMA_CONFIG.API_URL}/auth/token`, {
             method: 'POST',
             headers: { 
                 'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'User-Agent': 'Hotel-Backend/1.0'
+                'Accept': 'application/json'
             },
-            body: JSON.stringify(requestBody)
+            body: JSON.stringify({
+                email: TUMA_CONFIG.EMAIL,
+                api_key: TUMA_CONFIG.API_KEY
+            })
         });
         
-        console.log(`   📥 Response Status: ${response.status} ${response.statusText}`);
-        console.log(`   📥 Response Headers:`, Object.fromEntries(response.headers));
-        
         const responseText = await response.text();
-        console.log(`   📄 Response Body: ${responseText.substring(0, 500)}`);
+        console.log(`   📥 Response Status: ${response.status}`);
         
         if (!response.ok) {
-            console.error(`❌ [TUMA] Authentication failed with status ${response.status}`);
-            console.error(`   Response: ${responseText}`);
-            throw new Error(`Tuma auth failed: ${response.status} - ${responseText}`);
+            console.error(`❌ [TUMA] Authentication failed: ${responseText}`);
+            throw new Error(`Tuma auth failed: ${response.status}`);
         }
         
-        let data;
-        try {
-            data = JSON.parse(responseText);
-        } catch (e) {
-            console.error('❌ [TUMA] Failed to parse JSON response:', e.message);
-            throw new Error('Invalid JSON response from Tuma');
-        }
-        
-        console.log('   📊 Parsed Response Structure:', Object.keys(data));
-        
-        // Try multiple possible token locations
-        const token = data.token || 
-                     data.access_token || 
-                     data.data?.token || 
-                     data.data?.access_token ||
-                     data.auth_token;
+        const data = JSON.parse(responseText);
+        const token = data.token || data.access_token || data.data?.token;
         
         if (!token) {
-            console.error('❌ [TUMA] No token found in response. Available keys:', Object.keys(data));
-            console.error('   Full response:', JSON.stringify(data, null, 2));
-            throw new Error('No token received from Tuma - check your credentials');
+            throw new Error('No token received from Tuma');
         }
         
-        console.log('✅ [TUMA] Token obtained successfully!');
-        console.log(`   Token: ${token.substring(0, 20)}...`);
+        console.log('✅ [TUMA] Token obtained successfully');
         return token;
         
     } catch (error) {
         console.error('❌ [TUMA] Token error:', error.message);
-        if (error.stack) {
-            console.error('   Stack:', error.stack);
-        }
         throw error;
     }
 }
@@ -130,9 +92,7 @@ async function initiateTumaPayment(phone, amount, description, reference) {
     console.log(`   📝 Reference: ${reference}`);
     
     try {
-        // Get token first
         const token = await getTumaToken();
-        console.log('✅ [TUMA] Token obtained, proceeding with payment...');
         
         // Format phone number for Tuma (254XXXXXXXXX)
         const cleanPhone = phone.replace(/[^0-9]/g, '');
@@ -147,12 +107,14 @@ async function initiateTumaPayment(phone, amount, description, reference) {
         
         console.log(`   📱 Formatted Phone: ${formattedPhone}`);
         
+        // Tuma API expects 'account' instead of 'reference'
+        // The account field can hold your reference ID
         const payload = {
             amount: amount,
             phone: formattedPhone,
             callback_url: TUMA_CONFIG.CALLBACK_URL,
             description: description || 'HotBook Payment',
-            reference: reference || 'HOTBOOK-' + Date.now()
+            account: reference || 'HOTBOOK-' + Date.now()  // Changed from 'reference' to 'account'
         };
         
         console.log('   📤 Payment Payload:', JSON.stringify(payload, null, 2));
@@ -163,43 +125,31 @@ async function initiateTumaPayment(phone, amount, description, reference) {
             headers: {
                 'Authorization': `Bearer ${token}`,
                 'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'User-Agent': 'Hotel-Backend/1.0'
+                'Accept': 'application/json'
             },
             body: JSON.stringify(payload)
         });
         
-        console.log(`   📥 Response Status: ${response.status} ${response.statusText}`);
-        
         const responseText = await response.text();
+        console.log(`   📥 Response Status: ${response.status}`);
         console.log(`   📄 Response Body: ${responseText.substring(0, 500)}`);
         
         if (!response.ok) {
-            console.error(`❌ [TUMA] Payment request failed with status ${response.status}`);
-            console.error(`   Response: ${responseText}`);
-            throw new Error(`Payment request failed: ${response.status} - ${responseText}`);
+            console.error(`❌ [TUMA] Payment request failed: ${responseText}`);
+            const errorData = JSON.parse(responseText);
+            throw new Error(errorData.message || `Payment request failed: ${response.status}`);
         }
         
-        let result;
-        try {
-            result = JSON.parse(responseText);
-        } catch (e) {
-            console.error('❌ [TUMA] Failed to parse payment response:', e.message);
-            throw new Error('Invalid JSON response from Tuma payment');
-        }
+        const result = JSON.parse(responseText);
+        console.log('   ✅ Payment Response:', JSON.stringify(result, null, 2));
         
-        console.log('   📊 Payment Response Structure:', Object.keys(result));
-        console.log('   📊 Payment Response:', JSON.stringify(result, null, 2));
-        
-        // Extract transaction ID from various possible locations
+        // Extract transaction ID from response
         const transactionId = result.transaction_id || 
                              result.data?.transaction_id || 
                              result.id || 
-                             result.reference ||
                              'pending';
         
-        console.log(`✅ [TUMA] Payment initiated successfully!`);
-        console.log(`   Transaction ID: ${transactionId}`);
+        console.log(`✅ [TUMA] Payment initiated! Transaction ID: ${transactionId}`);
         
         return {
             success: true,
@@ -209,9 +159,6 @@ async function initiateTumaPayment(phone, amount, description, reference) {
         
     } catch (error) {
         console.error('❌ [TUMA] Payment error:', error.message);
-        if (error.stack) {
-            console.error('   Stack:', error.stack);
-        }
         throw error;
     }
 }
@@ -221,7 +168,6 @@ async function checkTumaPaymentStatus(transactionId) {
     
     try {
         const token = await getTumaToken();
-        console.log('✅ [TUMA] Token obtained, checking status...');
         
         const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/status/${transactionId}`, {
             method: 'GET',
@@ -232,19 +178,15 @@ async function checkTumaPaymentStatus(transactionId) {
             }
         });
         
-        console.log(`   📥 Response Status: ${response.status}`);
-        
         const responseText = await response.text();
+        console.log(`   📥 Response Status: ${response.status}`);
         console.log(`   📄 Response: ${responseText.substring(0, 500)}`);
         
         if (!response.ok) {
-            console.error(`❌ [TUMA] Status check failed: ${response.status}`);
             return { status: 'pending', paid: false };
         }
         
         const result = JSON.parse(responseText);
-        console.log('   📊 Status Response:', JSON.stringify(result, null, 2));
-        
         const status = result.status || result.data?.status || 'pending';
         const paid = status === 'completed' || status === 'paid' || status === 'success';
         
@@ -268,7 +210,6 @@ async function checkTumaPaymentStatus(transactionId) {
 
 app.post('/api/payment-callback', express.json({ type: 'application/json' }), async (req, res) => {
     console.log('\n📥 [CALLBACK] Payment callback received!');
-    console.log('   Headers:', req.headers);
     console.log('   Body:', JSON.stringify(req.body, null, 2));
     
     try {
@@ -277,7 +218,7 @@ app.post('/api/payment-callback', express.json({ type: 'application/json' }), as
             status, 
             amount, 
             phone, 
-            reference,
+            account,  // Changed from 'reference' to 'account'
             description 
         } = req.body;
         
@@ -291,7 +232,7 @@ app.post('/api/payment-callback', express.json({ type: 'application/json' }), as
             await processSuccessfulUnlockPayment(transaction_id, {
                 amount: amount,
                 phone: phone,
-                reference: reference,
+                reference: account,  // Use 'account' as reference
                 description: description
             });
         } else {
@@ -445,8 +386,7 @@ app.post('/api/payments/unlock', async (req, res) => {
     } catch (error) {
         console.error('❌ [API] Unlock payment error:', error);
         res.status(500).json({ 
-            error: 'Failed to initiate payment: ' + error.message,
-            details: error.stack
+            error: 'Failed to initiate payment: ' + error.message 
         });
     }
 });
@@ -766,7 +706,7 @@ async function getDateSpecificStats(hotelId, date) {
 }
 
 // ============================================================
-//  ADMIN ROUTES (Complete)
+//  ADMIN ROUTES
 // ============================================================
 
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
@@ -965,7 +905,7 @@ app.delete('/api/admin/users/:id', isAdmin, async (req, res) => {
 });
 
 // ============================================================
-//  HOTEL OWNER ROUTES (Complete)
+//  HOTEL OWNER ROUTES
 // ============================================================
 
 app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
