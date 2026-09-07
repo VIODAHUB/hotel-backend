@@ -1371,7 +1371,7 @@ app.post('/api/payments/card/confirm', async (req, res) => {
 
 app.get('/api/hotels/:id/access', async (req, res) => {
     const hotelId = parseInt(req.params.id);
-    const token = req.headers.authorization?.split(' '')[1];
+    const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.json({ hasAccess: false });
 
     try {
