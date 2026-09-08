@@ -1874,7 +1874,7 @@ app.post('/api/payments/mpesa/confirm', async (req, res) => {
 
 app.post('/api/payments/card/confirm', async (req, res) => {
     const { hotel_id, card_last4, amount } = req.body;
-    const token = req.headers.authorization?.split(' '')[1];
+    const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Not logged in' });
 
     try {
@@ -2425,19 +2425,8 @@ app.post('/api/conference/:hotelId', isHotelOwner, async (req, res) => {
     }
 });
 
-app.post('/api/conference', isHotelOwner, async (req, res) => {
-    const { hotel_id, hotelId, roomName, room_name, capacity, pricePerHour, price_per_hour, amenities } = req.body;
-    const finalHotelId = hotel_id || hotelId;
-    const finalRoomName = roomName || room_name;
-    const finalPrice = pricePerHour || price_per_hour;
-    
-    if (!finalHotelId || !finalRoomName || !capacity || !finalPrice) {
-        return res.status(400).json({ error: 'Missing required fields' });
-    }
-    
-    req.params = { hotelId: finalHotelId };
-    return app._router.handle(req, res, () => {});
-});
+// FIXED: Removed the problematic duplicate route that used app._router.handle
+// The route above handles /api/conference/:hotelId correctly
 
 app.get('/api/conference/hotel/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
