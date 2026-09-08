@@ -7,10 +7,6 @@ const { Pool } = require('pg');
 const app = express();
 const port = process.env.PORT || 5000;
 
-// ============================================================
-//  IMPORTANT: Bind to port BEFORE any error handling that might crash
-// ============================================================
-
 // Middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
@@ -28,15 +24,13 @@ const pool = new Pool({
 pool.connect((err) => {
     if (err) {
         console.error('❌ Database connection error:', err);
-        // Don't exit - allow server to start even if DB fails initially
-        console.log('⚠️ Server will start, but database features may not work.');
     } else {
         console.log('✅ Connected to PostgreSQL');
     }
 });
 
 // ============================================================
-//  HOTBOOK PAYMENT CONFIGURATION (For Subscriptions)
+//  HOTBOOK PAYMENT CONFIGURATION
 // ============================================================
 
 const HOTBOOK_PAYMENT = {
@@ -50,9 +44,7 @@ const HOTBOOK_PAYMENT = {
    - KES 1,000 for Basic Subscription (30 days)
    - KES 5,000 for Featured Subscription (30 days)
 5. Enter your M-Pesa PIN
-6. You will receive a confirmation message with a code
-
-After payment, enter the confirmation code in the space provided below.`
+6. You will receive a confirmation message with a code`
 };
 
 console.log('='.repeat(50));
@@ -62,7 +54,7 @@ console.log('   Business:', HOTBOOK_PAYMENT.BUSINESS_NAME);
 console.log('='.repeat(50));
 
 // ============================================================
-//  TUMA PAYMENT CONFIGURATION (Keep existing)
+//  TUMA PAYMENT CONFIGURATION
 // ============================================================
 
 const TUMA_CONFIG = {
@@ -78,12 +70,12 @@ console.log('📋 TUMA CONFIGURATION:');
 console.log('   Enabled:', TUMA_CONFIG.ENABLED ? '✅ Yes' : '❌ No');
 
 // ============================================================
-//  TUMA API HELPER FUNCTIONS
+//  TUMA API FUNCTIONS
 // ============================================================
 
 async function getTumaToken() {
     if (!TUMA_CONFIG.ENABLED || !TUMA_CONFIG.EMAIL || !TUMA_CONFIG.API_KEY) {
-        throw new Error('Tuma payments are disabled. Please use direct M-Pesa payment.');
+        throw new Error('Tuma payments are disabled.');
     }
     
     try {
@@ -118,7 +110,7 @@ async function getTumaToken() {
 
 async function initiateTumaPayment(phone, amount, description, reference) {
     if (!TUMA_CONFIG.ENABLED) {
-        throw new Error('Tuma payments are disabled. Please use direct M-Pesa payment.');
+        throw new Error('Tuma payments are disabled.');
     }
     
     try {
@@ -256,7 +248,7 @@ app.put('/api/hotels/owner/:id/payment-details', isHotelOwner, async (req, res) 
             return res.status(403).json({ error: 'You do not own this hotel' });
         }
         
-        const result = await pool.query(
+        await pool.query(
             `UPDATE hotels SET 
                 payment_method = COALESCE($1, payment_method),
                 paybill_number = COALESCE($2, paybill_number),
@@ -265,16 +257,14 @@ app.put('/api/hotels/owner/:id/payment-details', isHotelOwner, async (req, res) 
                 payment_instructions = COALESCE($5, payment_instructions),
                 payment_verification_enabled = COALESCE($6, payment_verification_enabled),
                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $7
-             RETURNING *`,
+             WHERE id = $7`,
             [payment_method, paybill_number, till_number, account_number_format, 
              payment_instructions, payment_verification_enabled, hotelId]
         );
         
         res.json({ 
             success: true, 
-            message: 'Payment details updated successfully',
-            hotel: result.rows[0]
+            message: 'Payment details updated successfully'
         });
     } catch (error) {
         console.error('Error updating payment details:', error);
@@ -283,7 +273,7 @@ app.put('/api/hotels/owner/:id/payment-details', isHotelOwner, async (req, res) 
 });
 
 // ============================================================
-//  PAYMENT VERIFICATION FOR BOOKINGS & ORDERS
+//  PAYMENT VERIFICATION
 // ============================================================
 
 app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
@@ -353,21 +343,9 @@ app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
             [confirmation_code, payment_method || 'mpesa', bookingId]
         );
         
-        const updated = await pool.query(
-            `SELECT * FROM room_bookings WHERE id = $1`,
-            [bookingId]
-        );
-        
         res.json({
             success: true,
-            message: '✅ Payment verified successfully! Your booking is confirmed.',
-            booking: updated.rows[0],
-            payment_details: {
-                hotel_name: booking.hotel_name,
-                paybill: booking.paybill_number,
-                till: booking.till_number,
-                instructions: booking.payment_instructions
-            }
+            message: '✅ Payment verified successfully! Your booking is confirmed.'
         });
         
     } catch (error) {
@@ -441,21 +419,9 @@ app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
             [confirmation_code, payment_method || 'mpesa', orderId]
         );
         
-        const updated = await pool.query(
-            `SELECT * FROM food_orders WHERE id = $1`,
-            [orderId]
-        );
-        
         res.json({
             success: true,
-            message: '✅ Payment verified successfully! Your order is confirmed.',
-            order: updated.rows[0],
-            payment_details: {
-                hotel_name: order.hotel_name,
-                paybill: order.paybill_number,
-                till: order.till_number,
-                instructions: order.payment_instructions
-            }
+            message: '✅ Payment verified successfully! Your order is confirmed.'
         });
         
     } catch (error) {
@@ -465,7 +431,7 @@ app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
 });
 
 // ============================================================
-//  SUBSCRIPTION PAYMENT (Hotel Owners pay HotBook)
+//  SUBSCRIPTION PAYMENT
 // ============================================================
 
 app.get('/api/payments/subscription/details', async (req, res) => {
@@ -499,7 +465,7 @@ app.post('/api/payments/subscription/initiate/:hotelId', isHotelOwner, async (re
         const reference = `SUB-${hotelId}-${Date.now().toString().slice(-6)}`;
         
         const currentSub = await pool.query(
-            'SELECT subscription_expiry, featured_expiry FROM hotels WHERE id = $1',
+            'SELECT subscription_expiry FROM hotels WHERE id = $1',
             [hotelId]
         );
         
@@ -542,7 +508,7 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
     
     try {
         const check = await pool.query(
-            'SELECT id, hotel_name FROM hotels WHERE id = $1 AND user_id = $2',
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
             [hotelId, req.userId]
         );
         if (check.rows.length === 0) {
@@ -639,8 +605,7 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
             message: `✅ Payment verified successfully! ${message}`,
             subscription_expiry: subscriptionExpiry,
             featured_expiry: featuredExpiry || null,
-            is_featured: isFeatured,
-            verification_code: confirmation_code
+            is_featured: isFeatured
         });
         
     } catch (error) {
@@ -655,7 +620,6 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
 
 app.post('/api/payment-callback', express.json({ type: 'application/json' }), async (req, res) => {
     console.log('\n📥 [CALLBACK] Payment callback received!');
-    console.log('   Body:', JSON.stringify(req.body, null, 2));
     
     try {
         const { 
@@ -678,8 +642,6 @@ app.post('/api/payment-callback', express.json({ type: 'application/json' }), as
                 reference: account || 'no-account',
                 description: description
             });
-        } else {
-            console.log(`⏳ [CALLBACK] Payment status: ${status} - not completed yet`);
         }
         
     } catch (error) {
@@ -747,7 +709,7 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
 }
 
 // ============================================================
-//  INITIATE UNLOCK PAYMENT (Client Tuma)
+//  INITIATE UNLOCK PAYMENT
 // ============================================================
 
 app.post('/api/payments/unlock', async (req, res) => {
@@ -785,10 +747,7 @@ app.post('/api/payments/unlock', async (req, res) => {
         if (!TUMA_CONFIG.ENABLED) {
             return res.json({
                 success: false,
-                message: 'Tuma payments are currently disabled. Please use direct M-Pesa payment.',
-                payment_method: 'direct',
-                hotel_id: hotel_id,
-                client_id: clientId
+                message: 'Tuma payments are currently disabled.'
             });
         }
         
@@ -851,7 +810,7 @@ app.get('/api/payments/status/:transactionId', async (req, res) => {
         }
         
         if (!TUMA_CONFIG.ENABLED) {
-            return res.json({ status: 'pending', paid: false, message: 'Tuma payments are disabled' });
+            return res.json({ status: 'pending', paid: false });
         }
         
         const status = await checkTumaPaymentStatus(transactionId);
@@ -1179,22 +1138,16 @@ app.get('/api/admin/hotels', isAdmin, async (req, res) => {
             const featured = await isHotelFeatured(h.id);
             
             let subscriptionDaysLeft = 0;
-            let subscriptionPaidDate = h.subscription_paid_date || h.created_at;
-            let subscriptionExpiryDate = h.subscription_expiry;
-            
-            if (subscriptionExpiryDate) {
+            if (h.subscription_expiry) {
                 const now = new Date();
-                const expiry = new Date(subscriptionExpiryDate);
+                const expiry = new Date(h.subscription_expiry);
                 subscriptionDaysLeft = Math.max(0, Math.ceil((expiry - now) / (1000 * 60 * 60 * 24)));
             }
             
             let featuredDaysLeft = 0;
-            let featuredPaidDate = h.featured_paid_date || h.created_at;
-            let featuredExpiryDate = h.featured_expiry;
-            
-            if (featuredExpiryDate) {
+            if (h.featured_expiry) {
                 const now = new Date();
-                const expiry = new Date(featuredExpiryDate);
+                const expiry = new Date(h.featured_expiry);
                 featuredDaysLeft = Math.max(0, Math.ceil((expiry - now) / (1000 * 60 * 60 * 24)));
             }
             
@@ -1203,11 +1156,7 @@ app.get('/api/admin/hotels', isAdmin, async (req, res) => {
                 is_visible: visible, 
                 is_featured_active: featured,
                 subscription_days_left: subscriptionDaysLeft,
-                subscription_paid_date: subscriptionPaidDate,
-                subscription_expiry: subscriptionExpiryDate,
-                featured_days_left: featuredDaysLeft,
-                featured_paid_date: featuredPaidDate,
-                featured_expiry: featuredExpiryDate
+                featured_days_left: featuredDaysLeft
             };
         }));
         res.json(hotels);
@@ -1459,11 +1408,7 @@ app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
                 is_visible: visible,
                 is_featured_active: featured,
                 subscription_days_left: subscriptionDaysLeft,
-                featured_days_left: featuredDaysLeft,
-                subscription_paid_date: h.subscription_paid_date || null,
-                featured_paid_date: h.featured_paid_date || null,
-                subscription_expiry: h.subscription_expiry || null,
-                featured_expiry: h.featured_expiry || null
+                featured_days_left: featuredDaysLeft
             };
         }));
         res.json(hotels);
@@ -1523,8 +1468,6 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             ...hotel,
             subscription_days_left: subscriptionDaysLeft,
             featured_days_left: featuredDaysLeft,
-            subscription_paid_date: hotel.subscription_paid_date || null,
-            featured_paid_date: hotel.featured_paid_date || null,
             room_bookings: roomBookings.rows || [],
             food_orders: foodOrders.rows || [],
             room_stats: {
@@ -1931,7 +1874,7 @@ app.post('/api/payments/mpesa/confirm', async (req, res) => {
 
 app.post('/api/payments/card/confirm', async (req, res) => {
     const { hotel_id, card_last4, amount } = req.body;
-    const token = req.headers.authorization?.split(' ')[1];
+    const token = req.headers.authorization?.split(' '')[1];
     if (!token) return res.status(401).json({ error: 'Not logged in' });
 
     try {
@@ -2649,7 +2592,7 @@ app.delete('/api/menu/:id', isHotelOwner, async (req, res) => {
 });
 
 // ============================================================
-//  START SERVER - MAKE SURE THIS IS AT THE VERY END
+//  START SERVER
 // ============================================================
 
 // CRITICAL: The server must bind to the port
@@ -2666,10 +2609,8 @@ app.listen(port, '0.0.0.0', () => {
 // Handle uncaught errors to prevent crashing
 process.on('uncaughtException', (err) => {
     console.error('❌ Uncaught Exception:', err);
-    // Don't exit - keep the server running
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-    // Don't exit - keep the server running
+    console.error('❌ Unhandled Rejection:', reason);
 });
