@@ -19,20 +19,7 @@ app.use(cors({ origin: '*' }));
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { 
-        rejectUnauthorized: false,
-        // For Supabase, you might need this:
-        sslmode: 'require'
-    }
-});
-
-// Test connection on startup
-pool.connect((err) => {
-    if (err) {
-        console.error('❌ Database connection error:', err);
-        console.error('   Please check your DATABASE_URL environment variable');
-        process.exit(1);
-    } else {
-        console.log('✅ Connected to Supabase PostgreSQL');
+        rejectUnauthorized: false
     }
 });
 
@@ -2847,7 +2834,6 @@ async function startServer() {
     } catch (error) {
         console.error('❌ Failed to start server:', error.message);
         console.error('   Make sure DATABASE_URL environment variable is set correctly');
-        console.error('   DATABASE_URL should look like: postgresql://postgres:password@db.xxxxx.supabase.co:5432/postgres');
         process.exit(1);
     }
 }
