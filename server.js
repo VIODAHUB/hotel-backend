@@ -228,6 +228,7 @@ app.get('/api/hotels/:id/payment-details', async (req, res) => {
     }
 });
 
+// FIXED: Added missing '=>' after (req, res)
 app.put('/api/hotels/owner/:id/payment-details', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.id);
     const { 
@@ -2424,9 +2425,6 @@ app.post('/api/conference/:hotelId', isHotelOwner, async (req, res) => {
         res.status(500).json({ error: 'Failed to create conference room: ' + error.message });
     }
 });
-
-// FIXED: Removed the problematic duplicate route that used app._router.handle
-// The route above handles /api/conference/:hotelId correctly
 
 app.get('/api/conference/hotel/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
