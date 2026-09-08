@@ -7,9 +7,18 @@ const { Pool } = require('pg');
 const app = express();
 const port = process.env.PORT || 5000;
 
+// ============================================================
+//  IMPORTANT: Bind to port BEFORE any error handling that might crash
+// ============================================================
+
+// Middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(cors({ origin: '*' }));
+
+// ============================================================
+//  DATABASE CONNECTION
+// ============================================================
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
@@ -17,8 +26,13 @@ const pool = new Pool({
 });
 
 pool.connect((err) => {
-    if (err) console.error('❌ Database connection error:', err);
-    else console.log('✅ Connected to PostgreSQL');
+    if (err) {
+        console.error('❌ Database connection error:', err);
+        // Don't exit - allow server to start even if DB fails initially
+        console.log('⚠️ Server will start, but database features may not work.');
+    } else {
+        console.log('✅ Connected to PostgreSQL');
+    }
 });
 
 // ============================================================
@@ -48,7 +62,7 @@ console.log('   Business:', HOTBOOK_PAYMENT.BUSINESS_NAME);
 console.log('='.repeat(50));
 
 // ============================================================
-//  TUMA PAYMENT CONFIGURATION (For Client Unlocks - Keeping for now)
+//  TUMA PAYMENT CONFIGURATION (Keep existing)
 // ============================================================
 
 const TUMA_CONFIG = {
@@ -57,17 +71,14 @@ const TUMA_CONFIG = {
     API_KEY: process.env.TUMA_API_KEY,
     CALLBACK_URL: process.env.TUMA_CALLBACK_URL || 'https://hotel-backend-s79n.onrender.com/api/payment-callback',
     TIMEOUT: 30000,
-    ENABLED: process.env.TUMA_ENABLED === 'true' // Can be disabled if using direct payments
+    ENABLED: process.env.TUMA_ENABLED === 'true'
 };
 
 console.log('📋 TUMA CONFIGURATION:');
 console.log('   Enabled:', TUMA_CONFIG.ENABLED ? '✅ Yes' : '❌ No');
-if (TUMA_CONFIG.ENABLED) {
-    console.log('   Email:', TUMA_CONFIG.EMAIL ? '✅ Set' : '❌ MISSING');
-}
 
 // ============================================================
-//  TUMA API HELPER FUNCTIONS (Keep existing for backward compatibility)
+//  TUMA API HELPER FUNCTIONS
 // ============================================================
 
 async function getTumaToken() {
@@ -195,7 +206,6 @@ async function checkTumaPaymentStatus(transactionId) {
 //  HOTEL PAYMENT DETAILS MANAGEMENT
 // ============================================================
 
-// Get hotel payment details (public)
 app.get('/api/hotels/:id/payment-details', async (req, res) => {
     try {
         const id = parseInt(req.params.id);
@@ -226,7 +236,6 @@ app.get('/api/hotels/:id/payment-details', async (req, res) => {
     }
 });
 
-// Update hotel payment details (hotel owner)
 app.put('/api/hotels/owner/:id/payment-details', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.id);
     const { 
@@ -277,7 +286,6 @@ app.put('/api/hotels/owner/:id/payment-details', isHotelOwner, async (req, res) 
 //  PAYMENT VERIFICATION FOR BOOKINGS & ORDERS
 // ============================================================
 
-// Verify payment for room booking
 app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
     const bookingId = parseInt(req.params.id);
     const { confirmation_code, payment_method } = req.body;
@@ -334,8 +342,6 @@ app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
             });
         }
         
-        // In production, you would verify with Safaricom API here
-        // For now, we'll accept the code with format validation
         await pool.query(
             `UPDATE room_bookings SET 
                 payment_confirmation_code = $1,
@@ -370,7 +376,6 @@ app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
     }
 });
 
-// Verify payment for food order
 app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
     const orderId = parseInt(req.params.id);
     const { confirmation_code, payment_method } = req.body;
@@ -459,55 +464,10 @@ app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
     }
 });
 
-// Get payment status for a booking
-app.get('/api/room-bookings/:id/payment-status', async (req, res) => {
-    const bookingId = parseInt(req.params.id);
-    try {
-        const result = await pool.query(
-            `SELECT id, payment_status, payment_verified, payment_confirmation_code, 
-                    payment_verified_at, payment_method
-             FROM room_bookings WHERE id = $1`,
-            [bookingId]
-        );
-        
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Booking not found' });
-        }
-        
-        res.json(result.rows[0]);
-    } catch (error) {
-        console.error('Error fetching payment status:', error);
-        res.status(500).json({ error: 'Failed to fetch payment status' });
-    }
-});
-
-// Get payment status for a food order
-app.get('/api/food-orders/:id/payment-status', async (req, res) => {
-    const orderId = parseInt(req.params.id);
-    try {
-        const result = await pool.query(
-            `SELECT id, payment_status, payment_verified, payment_confirmation_code, 
-                    payment_verified_at, payment_method
-             FROM food_orders WHERE id = $1`,
-            [orderId]
-        );
-        
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Order not found' });
-        }
-        
-        res.json(result.rows[0]);
-    } catch (error) {
-        console.error('Error fetching payment status:', error);
-        res.status(500).json({ error: 'Failed to fetch payment status' });
-    }
-});
-
 // ============================================================
 //  SUBSCRIPTION PAYMENT (Hotel Owners pay HotBook)
 // ============================================================
 
-// Get HotBook payment details for subscription
 app.get('/api/payments/subscription/details', async (req, res) => {
     res.json({
         till_number: HOTBOOK_PAYMENT.TILL_NUMBER,
@@ -520,7 +480,6 @@ app.get('/api/payments/subscription/details', async (req, res) => {
     });
 });
 
-// Initiate subscription payment (shows HotBook payment details)
 app.post('/api/payments/subscription/initiate/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     const { amount } = req.body;
@@ -539,14 +498,12 @@ app.post('/api/payments/subscription/initiate/:hotelId', isHotelOwner, async (re
         const amountToPay = isFeatured ? 5000 : 1000;
         const reference = `SUB-${hotelId}-${Date.now().toString().slice(-6)}`;
         
-        // Check if there's an active subscription to extend
         const currentSub = await pool.query(
             'SELECT subscription_expiry, featured_expiry FROM hotels WHERE id = $1',
             [hotelId]
         );
         
         const currentExpiry = currentSub.rows[0]?.subscription_expiry;
-        const currentFeatured = currentSub.rows[0]?.featured_expiry;
         const now = new Date();
         
         let expiryMessage = '';
@@ -575,7 +532,6 @@ app.post('/api/payments/subscription/initiate/:hotelId', isHotelOwner, async (re
     }
 });
 
-// Verify subscription payment
 app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     const { confirmation_code, reference, amount } = req.body;
@@ -593,7 +549,6 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
             return res.status(403).json({ error: 'You do not own this hotel' });
         }
         
-        // Validate confirmation code format
         const isValidFormat = /^[A-Z0-9]{4,12}$/i.test(confirmation_code);
         if (!isValidFormat) {
             return res.status(400).json({ 
@@ -607,7 +562,6 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
         let isFeatured = false;
         let message = '';
         
-        // Get current subscription expiry
         const currentData = await pool.query(
             'SELECT subscription_expiry, featured_expiry FROM hotels WHERE id = $1',
             [hotelId]
@@ -616,11 +570,9 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
         const currentExpiry = currentData.rows[0]?.subscription_expiry;
         const currentFeatured = currentData.rows[0]?.featured_expiry;
         
-        // Check if this is a featured subscription
         if (amount >= 5000) {
             isFeatured = true;
             
-            // Calculate featured expiry (extend from current if active)
             if (currentFeatured && new Date(currentFeatured) > now) {
                 featuredExpiry = new Date(currentFeatured);
                 featuredExpiry.setDate(featuredExpiry.getDate() + days);
@@ -631,7 +583,6 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
                 message = '🌟 Featured activated for 30 days!';
             }
             
-            // Also extend subscription alongside featured
             if (currentExpiry && new Date(currentExpiry) > now) {
                 subscriptionExpiry = new Date(currentExpiry);
                 subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
@@ -640,7 +591,6 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
                 subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
             }
         } else {
-            // Regular subscription
             if (currentExpiry && new Date(currentExpiry) > now) {
                 subscriptionExpiry = new Date(currentExpiry);
                 subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
@@ -652,7 +602,6 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
             }
         }
         
-        // Update hotel with subscription
         if (isFeatured) {
             await pool.query(
                 `UPDATE hotels SET 
@@ -701,7 +650,7 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
 });
 
 // ============================================================
-//  PAYMENT CALLBACK WEBHOOK (Tuma - Keeping for backward compatibility)
+//  PAYMENT CALLBACK WEBHOOK (Tuma)
 // ============================================================
 
 app.post('/api/payment-callback', express.json({ type: 'application/json' }), async (req, res) => {
@@ -798,7 +747,7 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
 }
 
 // ============================================================
-//  INITIATE UNLOCK PAYMENT (Client Tuma - Keeping for backward compatibility)
+//  INITIATE UNLOCK PAYMENT (Client Tuma)
 // ============================================================
 
 app.post('/api/payments/unlock', async (req, res) => {
@@ -833,7 +782,6 @@ app.post('/api/payments/unlock', async (req, res) => {
             });
         }
         
-        // If Tuma is disabled, provide direct payment option
         if (!TUMA_CONFIG.ENABLED) {
             return res.json({
                 success: false,
@@ -1187,7 +1135,7 @@ async function getDateSpecificStats(hotelId, date) {
 }
 
 // ============================================================
-//  ADMIN ROUTES (Complete)
+//  ADMIN ROUTES
 // ============================================================
 
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
@@ -1283,7 +1231,6 @@ app.get('/api/admin/hotels/:id', isAdmin, async (req, res) => {
     }
 });
 
-// Admin: Update hotel subscription days
 app.put('/api/admin/hotels/:id/subscription', isAdmin, async (req, res) => {
     const id = parseInt(req.params.id);
     const { subscription_days, featured_days } = req.body;
@@ -1945,7 +1892,7 @@ app.get('/api/hotels/:id', async (req, res) => {
 });
 
 // ============================================================
-//  LEGACY PAYMENT ROUTES (Keep for backward compatibility)
+//  LEGACY PAYMENT ROUTES
 // ============================================================
 
 const UNLOCK_PRICE = 100;
@@ -2702,9 +2649,10 @@ app.delete('/api/menu/:id', isHotelOwner, async (req, res) => {
 });
 
 // ============================================================
-//  START SERVER
+//  START SERVER - MAKE SURE THIS IS AT THE VERY END
 // ============================================================
 
+// CRITICAL: The server must bind to the port
 app.listen(port, '0.0.0.0', () => {
     console.log('\n' + '='.repeat(50));
     console.log('🚀 SERVER STARTED SUCCESSFULLY!');
@@ -2713,4 +2661,15 @@ app.listen(port, '0.0.0.0', () => {
     console.log(`   HotBook Till: ${HOTBOOK_PAYMENT.TILL_NUMBER} (${HOTBOOK_PAYMENT.BUSINESS_NAME})`);
     console.log(`   Tuma Payments: ${TUMA_CONFIG.ENABLED ? '✅ Enabled' : '❌ Disabled'}`);
     console.log('='.repeat(50));
+});
+
+// Handle uncaught errors to prevent crashing
+process.on('uncaughtException', (err) => {
+    console.error('❌ Uncaught Exception:', err);
+    // Don't exit - keep the server running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+    // Don't exit - keep the server running
 });
