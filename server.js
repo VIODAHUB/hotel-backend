@@ -2798,7 +2798,36 @@ app.get('/api/hotels/:id', async (req, res) => {
         res.status(500).json({ error: 'Server error' });
     }
 });
+// ============================================================
+//  CHECK EMAIL ENDPOINT (for login role detection)
+// ============================================================
 
+app.post('/api/auth/check-email', async (req, res) => {
+    const { email } = req.body;
+    
+    if (!email) {
+        return res.status(400).json({ error: 'Email is required' });
+    }
+    
+    try {
+        const result = await pool.query(
+            'SELECT user_type FROM users WHERE email = $1',
+            [email]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Email not found' });
+        }
+        
+        res.json({ 
+            exists: true, 
+            userType: result.rows[0].user_type 
+        });
+    } catch (error) {
+        console.error('Check email error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
 // ============================================================
 //  START SERVER
 // ============================================================
