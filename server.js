@@ -23,6 +23,17 @@ const pool = new Pool({
     }
 });
 
+// Test connection on startup
+pool.connect((err) => {
+    if (err) {
+        console.error('❌ Database connection error:', err);
+        console.error('   Please check your DATABASE_URL environment variable');
+        process.exit(1);
+    } else {
+        console.log('✅ Connected to Supabase PostgreSQL');
+    }
+});
+
 // ============================================================
 //  DATABASE SCHEMA CREATION
 // ============================================================
@@ -478,6 +489,7 @@ app.get('/api/hotels/:id/payment-details', async (req, res) => {
     }
 });
 
+// FIXED: Added missing '=>' after (req, res)
 app.put('/api/hotels/owner/:id/payment-details', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.id);
     const { 
@@ -554,6 +566,7 @@ app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
             return res.status(400).json({ error: 'Payment already verified for this booking' });
         }
         
+        // If verification is disabled, auto-verify
         if (booking.payment_verification_enabled === false) {
             await pool.query(
                 `UPDATE room_bookings SET 
@@ -573,6 +586,7 @@ app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
             });
         }
         
+        // Validate confirmation code format
         const isValidFormat = /^[A-Z0-9]{4,12}$/i.test(confirmation_code);
         if (!isValidFormat) {
             return res.status(400).json({ 
@@ -2834,6 +2848,7 @@ async function startServer() {
     } catch (error) {
         console.error('❌ Failed to start server:', error.message);
         console.error('   Make sure DATABASE_URL environment variable is set correctly');
+        console.error('   DATABASE_URL should look like: postgresql://postgres:password@db.xxxxx.supabase.co:5432/postgres');
         process.exit(1);
     }
 }
