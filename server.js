@@ -703,7 +703,7 @@ async function getDateSpecificStats(hotelId, date) {
 }
 
 // ============================================================
-//  ADMIN ROUTES
+//  ADMIN ROUTES (Enhanced with subscription tracking)
 // ============================================================
 
 app.get('/api/admin/stats', isAdmin, async (req, res) => {
@@ -745,7 +745,40 @@ app.get('/api/admin/hotels', isAdmin, async (req, res) => {
         const hotels = await Promise.all(result.rows.map(async (h) => {
             const visible = await isHotelVisible(h.id);
             const featured = await isHotelFeatured(h.id);
-            return { ...h, is_visible: visible, is_featured_active: featured };
+            
+            // Calculate days left for subscription
+            let subscriptionDaysLeft = 0;
+            let subscriptionPaidDate = h.subscription_paid_date || h.created_at;
+            let subscriptionExpiryDate = h.subscription_expiry;
+            
+            if (subscriptionExpiryDate) {
+                const now = new Date();
+                const expiry = new Date(subscriptionExpiryDate);
+                subscriptionDaysLeft = Math.max(0, Math.ceil((expiry - now) / (1000 * 60 * 60 * 24)));
+            }
+            
+            // Calculate days left for featured
+            let featuredDaysLeft = 0;
+            let featuredPaidDate = h.featured_paid_date || h.created_at;
+            let featuredExpiryDate = h.featured_expiry;
+            
+            if (featuredExpiryDate) {
+                const now = new Date();
+                const expiry = new Date(featuredExpiryDate);
+                featuredDaysLeft = Math.max(0, Math.ceil((expiry - now) / (1000 * 60 * 60 * 24)));
+            }
+            
+            return { 
+                ...h, 
+                is_visible: visible, 
+                is_featured_active: featured,
+                subscription_days_left: subscriptionDaysLeft,
+                subscription_paid_date: subscriptionPaidDate,
+                subscription_expiry: subscriptionExpiryDate,
+                featured_days_left: featuredDaysLeft,
+                featured_paid_date: featuredPaidDate,
+                featured_expiry: featuredExpiryDate
+            };
         }));
         res.json(hotels);
     } catch (error) {
@@ -765,6 +798,71 @@ app.get('/api/admin/hotels/:id', isAdmin, async (req, res) => {
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Admin: Update hotel subscription days
+app.put('/api/admin/hotels/:id/subscription', isAdmin, async (req, res) => {
+    const id = parseInt(req.params.id);
+    const { subscription_days, featured_days } = req.body;
+    
+    try {
+        const now = new Date();
+        let updates = [];
+        let values = [];
+        let paramCount = 1;
+        
+        // Update subscription expiry
+        if (subscription_days !== undefined && subscription_days >= 0) {
+            const newExpiry = new Date(now);
+            newExpiry.setDate(newExpiry.getDate() + subscription_days);
+            updates.push(`subscription_expiry = $${paramCount}`);
+            values.push(newExpiry);
+            paramCount++;
+            
+            updates.push(`subscription_paid_date = $${paramCount}`);
+            values.push(now);
+            paramCount++;
+        }
+        
+        // Update featured expiry
+        if (featured_days !== undefined && featured_days >= 0) {
+            const newExpiry = new Date(now);
+            newExpiry.setDate(newExpiry.getDate() + featured_days);
+            updates.push(`featured_expiry = $${paramCount}`);
+            values.push(newExpiry);
+            paramCount++;
+            
+            updates.push(`featured_paid_date = $${paramCount}`);
+            values.push(now);
+            paramCount++;
+        }
+        
+        if (updates.length === 0) {
+            return res.status(400).json({ error: 'No updates specified' });
+        }
+        
+        updates.push(`updated_at = $${paramCount}`);
+        values.push(now);
+        paramCount++;
+        
+        values.push(id);
+        
+        const query = `UPDATE hotels SET ${updates.join(', ')} WHERE id = $${paramCount} RETURNING *`;
+        const result = await pool.query(query, values);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Hotel not found' });
+        }
+        
+        res.json({ 
+            success: true, 
+            message: 'Hotel subscription updated successfully',
+            hotel: result.rows[0]
+        });
+    } catch (error) {
+        console.error('Update subscription error:', error);
+        res.status(500).json({ error: 'Failed to update subscription' });
     }
 });
 
@@ -792,10 +890,10 @@ app.post('/api/admin/hotels', isAdmin, async (req, res) => {
         }
         const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         const result = await pool.query(
-            `INSERT INTO hotels (user_id, hotel_name, phone, city, country, address, description, star_rating, is_active, photos, subscription_expiry, meals, drinks, whats_new)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            `INSERT INTO hotels (user_id, hotel_name, phone, city, country, address, description, star_rating, is_active, photos, subscription_expiry, subscription_paid_date, meals, drinks, whats_new)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, '[]', '[]', '')
              RETURNING *`,
-            [userId, hotelName, phone || '', city, country, address || '', description || '', starRating || 3, isActive !== undefined ? isActive : true, photos || [], subscriptionExpiry, '[]', '[]', '']
+            [userId, hotelName, phone || '', city, country, address || '', description || '', starRating || 3, isActive !== undefined ? isActive : true, photos || [], subscriptionExpiry, new Date()]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -914,14 +1012,33 @@ app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
         const hotels = await Promise.all(result.rows.map(async (h) => {
             const visible = await isHotelVisible(h.id);
             const featured = await isHotelFeatured(h.id);
-            const daysLeft = h.subscription_expiry ?
-                Math.max(0, Math.ceil((new Date(h.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
-                0;
+            
+            // Calculate subscription days left
+            let subscriptionDaysLeft = 0;
+            if (h.subscription_expiry) {
+                const now = new Date();
+                const expiry = new Date(h.subscription_expiry);
+                subscriptionDaysLeft = Math.max(0, Math.ceil((expiry - now) / (1000 * 60 * 60 * 24)));
+            }
+            
+            // Calculate featured days left
+            let featuredDaysLeft = 0;
+            if (h.featured_expiry) {
+                const now = new Date();
+                const expiry = new Date(h.featured_expiry);
+                featuredDaysLeft = Math.max(0, Math.ceil((expiry - now) / (1000 * 60 * 60 * 24)));
+            }
+            
             return {
                 ...h,
                 is_visible: visible,
                 is_featured_active: featured,
-                subscription_days_left: daysLeft
+                subscription_days_left: subscriptionDaysLeft,
+                featured_days_left: featuredDaysLeft,
+                subscription_paid_date: h.subscription_paid_date || null,
+                featured_paid_date: h.featured_paid_date || null,
+                subscription_expiry: h.subscription_expiry || null,
+                featured_expiry: h.featured_expiry || null
             };
         }));
         res.json(hotels);
@@ -963,13 +1080,27 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
-        const daysLeft = hotel.subscription_expiry ?
-            Math.max(0, Math.ceil((new Date(hotel.subscription_expiry) - new Date()) / (1000 * 60 * 60 * 24))) :
-            0;
+        // Calculate days left
+        let subscriptionDaysLeft = 0;
+        if (hotel.subscription_expiry) {
+            const now = new Date();
+            const expiry = new Date(hotel.subscription_expiry);
+            subscriptionDaysLeft = Math.max(0, Math.ceil((expiry - now) / (1000 * 60 * 60 * 24)));
+        }
+        
+        let featuredDaysLeft = 0;
+        if (hotel.featured_expiry) {
+            const now = new Date();
+            const expiry = new Date(hotel.featured_expiry);
+            featuredDaysLeft = Math.max(0, Math.ceil((expiry - now) / (1000 * 60 * 60 * 24)));
+        }
 
         res.json({
             ...hotel,
-            subscription_days_left: daysLeft,
+            subscription_days_left: subscriptionDaysLeft,
+            featured_days_left: featuredDaysLeft,
+            subscription_paid_date: hotel.subscription_paid_date || null,
+            featured_paid_date: hotel.featured_paid_date || null,
             room_bookings: roomBookings.rows || [],
             food_orders: foodOrders.rows || [],
             room_stats: {
@@ -1049,10 +1180,10 @@ app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
     try {
         const subscriptionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         const result = await pool.query(
-            `INSERT INTO hotels (user_id, hotel_name, city, country, phone, address, description, star_rating, subscription_expiry, is_active, meals, drinks, whats_new)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, '[]', '[]', '')
+            `INSERT INTO hotels (user_id, hotel_name, city, country, phone, address, description, star_rating, subscription_expiry, subscription_paid_date, is_active, meals, drinks, whats_new)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, '[]', '[]', '')
              RETURNING *`,
-            [req.userId, hotelName || 'My Hotel', city || '', country || '', phone || '', address || '', description || '', starRating || 3, subscriptionExpiry]
+            [req.userId, hotelName || 'My Hotel', city || '', country || '', phone || '', address || '', description || '', starRating || 3, subscriptionExpiry, new Date()]
         );
         res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -1062,7 +1193,7 @@ app.post('/api/hotels/owner/create', isHotelOwner, async (req, res) => {
 });
 
 // ============================================================
-//  SUBSCRIPTION - FIXED
+//  SUBSCRIPTION - FIXED (Non-linear days)
 // ============================================================
 
 app.post('/api/payments/subscribe/:hotelId', isHotelOwner, async (req, res) => {
@@ -1074,76 +1205,113 @@ app.post('/api/payments/subscribe/:hotelId', isHotelOwner, async (req, res) => {
     try {
         // Check if user owns this hotel
         const check = await pool.query(
-            'SELECT id, subscription_expiry FROM hotels WHERE id = $1 AND user_id = $2',
+            'SELECT id, subscription_expiry, featured_expiry FROM hotels WHERE id = $1 AND user_id = $2',
             [hotelId, req.userId]
         );
         if (check.rows.length === 0) {
             return res.status(403).json({ error: 'You do not own this hotel' });
         }
 
-        const currentExpiry = check.rows[0].subscription_expiry;
         const now = new Date();
-        
-        // Calculate new expiry date (30 days from now OR extend existing)
         const days = 30;
-        let expiryDate;
+        let subscriptionExpiry = null;
+        let featuredExpiry = null;
+        let message = '';
+        let isFeatured = false;
         
-        // If there's an existing expiry date that's in the future, extend from there
-        if (currentExpiry && new Date(currentExpiry) > now) {
-            expiryDate = new Date(currentExpiry);
-            expiryDate.setDate(expiryDate.getDate() + days);
-            console.log(`📅 Extending subscription from ${currentExpiry} to ${expiryDate}`);
-        } else {
-            expiryDate = new Date(now);
-            expiryDate.setDate(expiryDate.getDate() + days);
-            console.log(`📅 New subscription from ${now} to ${expiryDate}`);
-        }
-        
-        // Featured subscription (5000 KES) - adds featured status + subscription
+        // Featured subscription (5000 KES)
         if (amount >= 5000) {
-            const featuredExpiry = new Date(expiryDate);
+            isFeatured = true;
+            
+            // Calculate featured expiry - extend from existing if available and not expired
+            const currentFeaturedExpiry = check.rows[0].featured_expiry;
+            if (currentFeaturedExpiry && new Date(currentFeaturedExpiry) > now) {
+                featuredExpiry = new Date(currentFeaturedExpiry);
+                featuredExpiry.setDate(featuredExpiry.getDate() + days);
+                message = `🌟 Featured extended by ${days} days from current expiry!`;
+            } else {
+                featuredExpiry = new Date(now);
+                featuredExpiry.setDate(featuredExpiry.getDate() + days);
+                message = `🌟 Featured activated for ${days} days!`;
+            }
+            
+            // Also ensure subscription is active (extends subscription alongside featured)
+            const currentSubExpiry = check.rows[0].subscription_expiry;
+            if (currentSubExpiry && new Date(currentSubExpiry) > now) {
+                subscriptionExpiry = new Date(currentSubExpiry);
+                subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
+            } else {
+                subscriptionExpiry = new Date(now);
+                subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
+            }
+            
             await pool.query(
                 `UPDATE hotels SET 
                     is_active = TRUE,
                     subscription_expiry = $1,
+                    subscription_paid_date = $2,
                     is_featured = TRUE,
-                    featured_expiry = $2,
+                    featured_expiry = $3,
+                    featured_paid_date = $4,
                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $3`,
-                [expiryDate, featuredExpiry, hotelId]
+                 WHERE id = $5`,
+                [subscriptionExpiry, now, featuredExpiry, now, hotelId]
             );
+            
             console.log(`✅ Featured subscription activated for hotel ${hotelId}`);
             
-            res.json({
-                success: true,
-                message: `✅ Subscription successful! 🌟 Hotel is now FEATURED for 30 days!`,
-                expiry_date: expiryDate,
-                featured: true
-            });
         } 
         // Regular subscription (1000 KES)
         else if (amount >= 1000) {
+            // Calculate subscription expiry - extend from existing if available
+            const currentSubExpiry = check.rows[0].subscription_expiry;
+            if (currentSubExpiry && new Date(currentSubExpiry) > now) {
+                subscriptionExpiry = new Date(currentSubExpiry);
+                subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
+                message = `✅ Subscription extended by ${days} days from current expiry!`;
+            } else {
+                subscriptionExpiry = new Date(now);
+                subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
+                message = `✅ Subscription activated for ${days} days!`;
+            }
+            
             await pool.query(
                 `UPDATE hotels SET 
                     is_active = TRUE,
                     subscription_expiry = $1,
+                    subscription_paid_date = $2,
                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $2`,
-                [expiryDate, hotelId]
+                 WHERE id = $3`,
+                [subscriptionExpiry, now, hotelId]
             );
             console.log(`✅ Subscription activated for hotel ${hotelId}`);
             
-            res.json({
-                success: true,
-                message: `✅ Subscription successful! Hotel is visible for 30 days.`,
-                expiry_date: expiryDate,
-                featured: false
-            });
         } else {
             return res.status(400).json({ 
                 error: 'Invalid subscription amount. Minimum is 1000 KES.' 
             });
         }
+        
+        // Calculate days left for response
+        let daysLeft = 0;
+        if (subscriptionExpiry) {
+            daysLeft = Math.max(0, Math.ceil((new Date(subscriptionExpiry) - new Date()) / (1000 * 60 * 60 * 24)));
+        }
+        
+        let featuredDaysLeft = 0;
+        if (featuredExpiry) {
+            featuredDaysLeft = Math.max(0, Math.ceil((new Date(featuredExpiry) - new Date()) / (1000 * 60 * 60 * 24)));
+        }
+        
+        res.json({
+            success: true,
+            message: message || 'Subscription successful!',
+            subscription_days_left: daysLeft,
+            featured_days_left: featuredDaysLeft,
+            is_featured: isFeatured,
+            subscription_expiry: subscriptionExpiry,
+            featured_expiry: featuredExpiry
+        });
         
     } catch (error) {
         console.error('❌ Subscription error:', error);
