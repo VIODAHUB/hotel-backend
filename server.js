@@ -2798,7 +2798,384 @@ app.get('/api/hotels/:id', async (req, res) => {
         res.status(500).json({ error: 'Server error' });
     }
 });
+// ============================================================
+//  PAYMENT CODES ROUTES - Store and retrieve M-Pesa codes
+// ============================================================
 
+// Save a payment code from a client booking
+app.post('/api/payment-codes', async (req, res) => {
+    const { hotel_id, booking_id, order_id, client_name, client_phone, confirmation_code, amount, booking_reference } = req.body;
+    
+    if (!confirmation_code || confirmation_code.length < 4) {
+        return res.status(400).json({ error: 'Valid confirmation code is required' });
+    }
+    
+    try {
+        const result = await pool.query(
+            `INSERT INTO payment_codes 
+             (hotel_id, booking_id, order_id, client_name, client_phone, confirmation_code, amount, booking_reference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING *`,
+            [hotel_id, booking_id || null, order_id || null, client_name || null, client_phone || null, 
+             confirmation_code.toUpperCase(), amount || 0, booking_reference || null]
+        );
+        
+        res.status(201).json({ success: true, payment_code: result.rows[0] });
+    } catch (error) {
+        console.error('Error saving payment code:', error);
+        res.status(500).json({ error: 'Failed to save payment code' });
+    }
+});
+
+// Get payment codes for a hotel (owner only)
+app.get('/api/hotels/owner/:hotelId/payment-codes', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    
+    try {
+        const result = await pool.query(
+            `SELECT pc.*, 
+                    rb.booking_reference as room_booking_ref,
+                    fo.booking_reference as food_order_ref,
+                    rb.client_name as room_client,
+                    fo.client_name as food_client
+             FROM payment_codes pc
+             LEFT JOIN room_bookings rb ON pc.booking_id = rb.id
+             LEFT JOIN food_orders fo ON pc.order_id = fo.id
+             WHERE pc.hotel_id = $1
+             ORDER BY pc.created_at DESC`,
+            [hotelId]
+        );
+        
+        const codes = result.rows.map(row => ({
+            id: row.id,
+            hotel_id: row.hotel_id,
+            confirmation_code: row.confirmation_code,
+            amount: row.amount,
+            client_name: row.client_name || row.room_client || row.food_client || 'N/A',
+            booking_reference: row.booking_reference || row.room_booking_ref || row.food_order_ref || 'N/A',
+            verified: row.verified,
+            verified_at: row.verified_at,
+            created_at: row.created_at
+        }));
+        
+        res.json({ codes });
+    } catch (error) {
+        console.error('Error fetching payment codes:', error);
+        res.status(500).json({ error: 'Failed to fetch payment codes' });
+    }
+});
+
+// Verify a payment code (owner marks as verified)
+app.put('/api/payments/verify-code/:codeId', isHotelOwner, async (req, res) => {
+    const codeId = parseInt(req.params.codeId);
+    
+    try {
+        // Verify the owner owns the hotel associated with this code
+        const check = await pool.query(
+            `SELECT pc.hotel_id FROM payment_codes pc 
+             WHERE pc.id = $1`,
+            [codeId]
+        );
+        
+        if (check.rows.length === 0) {
+            return res.status(404).json({ error: 'Payment code not found' });
+        }
+        
+        const hotelId = check.rows[0].hotel_id;
+        const ownerCheck = await pool.query(
+            'SELECT id FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        
+        if (ownerCheck.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this hotel' });
+        }
+        
+        await pool.query(
+            `UPDATE payment_codes SET 
+                verified = TRUE, 
+                verified_at = CURRENT_TIMESTAMP 
+             WHERE id = $1`,
+            [codeId]
+        );
+        
+        res.json({ success: true, message: 'Payment code verified successfully' });
+    } catch (error) {
+        console.error('Error verifying payment code:', error);
+        res.status(500).json({ error: 'Failed to verify payment code' });
+    }
+});
+
+// ============================================================
+//  FIXED ROOM BOOKING - Store payment code properly
+// ============================================================
+
+// Override the room booking payment verification to store payment codes
+app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
+    const bookingId = parseInt(req.params.id);
+    const { confirmation_code, payment_method } = req.body;
+    
+    if (!confirmation_code || confirmation_code.length < 4) {
+        return res.status(400).json({ error: 'Please enter a valid payment confirmation code' });
+    }
+    
+    try {
+        const bookingResult = await pool.query(
+            `SELECT rb.*, h.paybill_number, h.till_number, h.payment_instructions, h.hotel_name,
+                    h.payment_verification_enabled, h.id as hotel_id
+             FROM room_bookings rb
+             JOIN hotels h ON rb.hotel_id = h.id
+             WHERE rb.id = $1`,
+            [bookingId]
+        );
+        
+        if (bookingResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Booking not found' });
+        }
+        
+        const booking = bookingResult.rows[0];
+        
+        if (booking.payment_verified) {
+            return res.status(400).json({ error: 'Payment already verified for this booking' });
+        }
+        
+        const formattedCode = confirmation_code.toUpperCase();
+        
+        // Update the booking
+        await pool.query(
+            `UPDATE room_bookings SET 
+                payment_confirmation_code = $1,
+                payment_verified = TRUE,
+                payment_verified_at = CURRENT_TIMESTAMP,
+                payment_status = 'paid',
+                payment_method = $2
+             WHERE id = $3`,
+            [formattedCode, payment_method || 'mpesa', bookingId]
+        );
+        
+        // Store payment code in the payment_codes table
+        await pool.query(
+            `INSERT INTO payment_codes 
+             (hotel_id, booking_id, client_name, client_phone, confirmation_code, amount, booking_reference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [booking.hotel_id, bookingId, booking.client_name, booking.client_phone, 
+             formattedCode, booking.total_amount, booking.booking_reference]
+        );
+        
+        res.json({
+            success: true,
+            message: '✅ Payment verified successfully! Your booking is confirmed.'
+        });
+        
+    } catch (error) {
+        console.error('Payment verification error:', error);
+        res.status(500).json({ error: 'Failed to verify payment: ' + error.message });
+    }
+});
+
+// ============================================================
+//  FIXED FOOD ORDER - Store payment code properly
+// ============================================================
+
+app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
+    const orderId = parseInt(req.params.id);
+    const { confirmation_code, payment_method } = req.body;
+    
+    if (!confirmation_code || confirmation_code.length < 4) {
+        return res.status(400).json({ error: 'Please enter a valid payment confirmation code' });
+    }
+    
+    try {
+        const orderResult = await pool.query(
+            `SELECT fo.*, h.paybill_number, h.till_number, h.payment_instructions, h.hotel_name,
+                    h.payment_verification_enabled, h.id as hotel_id
+             FROM food_orders fo
+             JOIN hotels h ON fo.hotel_id = h.id
+             WHERE fo.id = $1`,
+            [orderId]
+        );
+        
+        if (orderResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Order not found' });
+        }
+        
+        const order = orderResult.rows[0];
+        
+        if (order.payment_verified) {
+            return res.status(400).json({ error: 'Payment already verified for this order' });
+        }
+        
+        const formattedCode = confirmation_code.toUpperCase();
+        
+        await pool.query(
+            `UPDATE food_orders SET 
+                payment_confirmation_code = $1,
+                payment_verified = TRUE,
+                payment_verified_at = CURRENT_TIMESTAMP,
+                payment_status = 'paid',
+                payment_method = $2
+             WHERE id = $3`,
+            [formattedCode, payment_method || 'mpesa', orderId]
+        );
+        
+        // Store payment code
+        await pool.query(
+            `INSERT INTO payment_codes 
+             (hotel_id, order_id, client_name, client_phone, confirmation_code, amount, booking_reference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [order.hotel_id, orderId, order.client_name, order.client_phone, 
+             formattedCode, order.total_amount, order.booking_reference]
+        );
+        
+        res.json({
+            success: true,
+            message: '✅ Payment verified successfully! Your order is confirmed.'
+        });
+        
+    } catch (error) {
+        console.error('Payment verification error:', error);
+        res.status(500).json({ error: 'Failed to verify payment: ' + error.message });
+    }
+});
+
+// ============================================================
+//  FIXED MY BOOKINGS - Include all bookings
+// ============================================================
+
+app.get('/api/my-bookings', async (req, res) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.json({ unlocked_hotels: [], room_bookings: [], food_orders: [] });
+        }
+
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+        const clientId = decoded.id;
+
+        // Unlocked hotels
+        const unlocked = await pool.query(
+            `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
+             FROM payments p
+             JOIN hotels h ON p.hotel_id = h.id
+             WHERE p.client_id = $1 AND p.paid = TRUE AND p.expires_at > NOW()
+             ORDER BY p.created_at DESC`,
+            [clientId]
+        );
+
+        // Room bookings - include ALL bookings for this client
+        const roomBookings = await pool.query(
+            `SELECT rb.*, 
+                    COALESCE(r.room_type_name, 'Unknown') as room_type_name, 
+                    COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
+             FROM room_bookings rb
+             LEFT JOIN rooms r ON rb.room_type_id = r.id
+             LEFT JOIN hotels h ON rb.hotel_id = h.id
+             WHERE rb.client_id = $1
+             ORDER BY rb.created_at DESC`,
+            [clientId]
+        );
+
+        // Food orders - include ALL orders for this client
+        const foodOrders = await pool.query(
+            `SELECT fo.*, COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
+             FROM food_orders fo
+             LEFT JOIN hotels h ON fo.hotel_id = h.id
+             WHERE fo.client_id = $1
+             ORDER BY fo.created_at DESC`,
+            [clientId]
+        );
+
+        res.json({
+            unlocked_hotels: unlocked.rows || [],
+            room_bookings: roomBookings.rows || [],
+            food_orders: foodOrders.rows.map(o => ({
+                ...o,
+                items: typeof o.items === 'string' ? JSON.parse(o.items) : (o.items || [])
+            }))
+        });
+    } catch (error) {
+        console.error('My bookings error:', error);
+        res.json({ unlocked_hotels: [], room_bookings: [], food_orders: [] });
+    }
+});
+
+// ============================================================
+//  FIXED TUMA PAYMENT - Better error handling
+// ============================================================
+
+async function initiateTumaPayment(phone, amount, description, reference) {
+    if (!TUMA_CONFIG.ENABLED) {
+        // Fallback: Return success with mock transaction for testing
+        console.log('⚠️ Tuma payments disabled - using mock payment');
+        return {
+            success: true,
+            transaction_id: 'MOCK-' + Date.now(),
+            mock: true,
+            message: 'Tuma payments are disabled. This is a mock payment for testing.'
+        };
+    }
+    
+    try {
+        const token = await getTumaToken();
+        const cleanPhone = phone.replace(/[^0-9]/g, '');
+        let formattedPhone;
+        if (cleanPhone.startsWith('0')) {
+            formattedPhone = '254' + cleanPhone.slice(1);
+        } else if (cleanPhone.startsWith('254')) {
+            formattedPhone = cleanPhone;
+        } else {
+            formattedPhone = '254' + cleanPhone;
+        }
+        
+        const payload = {
+            amount: amount,
+            phone: formattedPhone,
+            callback_url: TUMA_CONFIG.CALLBACK_URL,
+            description: description || 'HotBook Payment'
+        };
+        
+        console.log('📤 Tuma payment request:', JSON.stringify(payload, null, 2));
+        
+        const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/stk-push`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+        
+        const responseText = await response.text();
+        console.log('📥 Tuma response:', responseText);
+        
+        if (!response.ok) {
+            // Check if it's a known error
+            try {
+                const errorData = JSON.parse(responseText);
+                throw new Error(errorData.message || errorData.error || `HTTP ${response.status}`);
+            } catch (parseError) {
+                throw new Error(`Payment request failed: ${response.status}`);
+            }
+        }
+        
+        const result = JSON.parse(responseText);
+        const transactionId = result.transaction_id || result.data?.transaction_id || 'pending';
+        
+        return {
+            success: true,
+            transaction_id: transactionId,
+            raw_response: result
+        };
+    } catch (error) {
+        console.error('❌ Tuma payment error:', error.message);
+        // Don't throw - return error object
+        return {
+            success: false,
+            message: error.message || 'Payment initiation failed'
+        };
+    }
+}
 // ============================================================
 //  START SERVER
 // ============================================================
