@@ -2818,40 +2818,76 @@ app.post('/api/room-bookings', async (req, res) => {
 // ============================================================
 //  FIXED FOOD ORDER - Store payment code properly
 // ============================================================
-app.post('/api/food-orders', async (req, res) => {
+app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
+    const orderId = parseInt(req.params.id);
+    const { confirmation_code, payment_method } = req.body;
+    
+    if (!confirmation_code || confirmation_code.length < 4) {
+        return res.status(400).json({ error: 'Please enter a valid payment confirmation code' });
+    }
+    
     try {
-        const { hotel_id, items, pickup_date, pickup_time, special_instructions } = req.body;
-        const token = req.headers.authorization?.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ error: 'Please login first' });
-        }
-
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
-        const clientId = decoded.id;
-        
-        console.log('📋 [FOOD ORDER] Client ID:', clientId);
-        console.log('📋 [FOOD ORDER] Hotel:', hotel_id, 'Items:', items);
-
-        let total = 0;
-        items.forEach(item => total += item.price * item.quantity);
-        const bookingRef = 'FOOD-' + Date.now().toString().slice(-8);
-
-        const result = await pool.query(
-            `INSERT INTO food_orders (client_id, hotel_id, items, total_amount, pickup_date, pickup_time, special_instructions, payment_status, booking_reference, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, 'pending')
-             RETURNING *`,
-            [clientId, hotel_id, JSON.stringify(items), total, pickup_date, pickup_time, special_instructions || '', bookingRef]
+        const orderResult = await pool.query(
+            `SELECT fo.*, h.paybill_number, h.till_number, h.payment_instructions, h.hotel_name,
+                    h.payment_verification_enabled, h.id as hotel_id
+             FROM food_orders fo
+             JOIN hotels h ON fo.hotel_id = h.id
+             WHERE fo.id = $1`,
+            [orderId]
         );
         
-        console.log('✅ [FOOD ORDER] Created order ID:', result.rows[0].id, 'Ref:', bookingRef);
-        res.status(201).json(result.rows[0]);
+        if (orderResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Order not found' });
+        }
+        
+        const order = orderResult.rows[0];
+        
+        if (order.payment_verified) {
+            return res.status(400).json({ error: 'Payment already verified for this order' });
+        }
+        
+        const formattedCode = confirmation_code.toUpperCase();
+        
+        await pool.query(
+            `UPDATE food_orders SET 
+                payment_confirmation_code = $1,
+                payment_verified = TRUE,
+                payment_verified_at = CURRENT_TIMESTAMP,
+                payment_status = 'paid',
+                payment_method = $2,
+                status = 'confirmed'
+             WHERE id = $3`,
+            [formattedCode, payment_method || 'mpesa', orderId]
+        );
+        
+        // Store payment code
+        const clientName = order.client_name || 'Guest';
+        const clientPhone = order.client_phone || '';
+        
+        await pool.query(
+            `INSERT INTO payment_codes 
+             (hotel_id, order_id, client_name, client_phone, confirmation_code, amount, booking_reference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [order.hotel_id, orderId, clientName, clientPhone, 
+             formattedCode, order.total_amount, order.booking_reference]
+        );
+        
+        console.log('✅ Payment verified for food order:', orderId, 'Code:', formattedCode);
+        
+        res.json({
+            success: true,
+            message: '✅ Payment verified successfully! Your order is confirmed.'
+        });
+        
     } catch (error) {
-        console.error('❌ Food order error:', error);
-        res.status(500).json({ error: 'Failed to place order: ' + error.message });
+        console.error('Payment verification error:', error);
+        res.status(500).json({ error: 'Failed to verify payment: ' + error.message });
     }
 });
-
-app.get('/api/my-bookings', async (req, res) => {
+// ============================================================
+//  MY BOOKINGS ENDPOINT
+// ============================================================
+   app.get('/api/my-bookings', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
         if (!token) {
@@ -2861,7 +2897,7 @@ app.get('/api/my-bookings', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
 
-        console.log(`📋 Fetching bookings for client: ${clientId}`);
+        console.log(`📋 [MY BOOKINGS] Fetching for client: ${clientId}`);
 
         // Unlocked hotels
         const unlocked = await pool.query(
@@ -2877,8 +2913,7 @@ app.get('/api/my-bookings', async (req, res) => {
         const roomBookings = await pool.query(
             `SELECT rb.*, 
                     COALESCE(r.room_type_name, 'Unknown') as room_type_name, 
-                    COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name,
-                    h.hotel_name as hotel_name
+                    COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
              FROM room_bookings rb
              LEFT JOIN rooms r ON rb.room_type_id = r.id
              LEFT JOIN hotels h ON rb.hotel_id = h.id
@@ -2897,7 +2932,7 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        console.log(`📋 Found ${unlocked.rows.length} unlocked, ${roomBookings.rows.length} room bookings, ${foodOrders.rows.length} food orders`);
+        console.log(`📋 [MY BOOKINGS] Found: ${unlocked.rows.length} unlocked, ${roomBookings.rows.length} room bookings, ${foodOrders.rows.length} food orders`);
 
         res.json({
             unlocked_hotels: unlocked.rows || [],
@@ -2911,7 +2946,8 @@ app.get('/api/my-bookings', async (req, res) => {
         console.error('❌ My bookings error:', error);
         res.json({ unlocked_hotels: [], room_bookings: [], food_orders: [] });
     }
-});
+}); 
+
 // ============================================================
 //  TUMA PAYMENT INITIATION
 // ============================================================
