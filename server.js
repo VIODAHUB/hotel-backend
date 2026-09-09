@@ -3030,6 +3030,9 @@ app.get('/api/my-bookings', async (req, res) => {
         res.json({ unlocked_hotels: [], room_bookings: [], food_orders: [] });
     }
 });
+// ============================================================
+//  TUMA PAYMENT INITIATION
+// ============================================================
 
  async function initiateTumaPayment(phone, amount, description, reference) {
     console.log(`📤 Initiating Tuma payment: ${amount} KES to ${phone}`);
