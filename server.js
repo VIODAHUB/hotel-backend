@@ -299,9 +299,8 @@ console.log('   Business:', HOTBOOK_PAYMENT.BUSINESS_NAME);
 console.log('='.repeat(50));
 
 // ============================================================
-//  TUMA PAYMENT CONFIGURATION
+//  TUMA PAYMENT CONFIGURATION - FIXED
 // ============================================================
-
 const TUMA_CONFIG = {
     API_URL: process.env.TUMA_API_URL || 'https://api.tuma.co.ke',
     EMAIL: process.env.TUMA_EMAIL,
@@ -313,17 +312,27 @@ const TUMA_CONFIG = {
 
 console.log('📋 TUMA CONFIGURATION:');
 console.log('   Enabled:', TUMA_CONFIG.ENABLED ? '✅ Yes' : '❌ No');
+console.log('   Email:', TUMA_CONFIG.EMAIL ? '✅ Set' : '❌ Missing');
+console.log('   API Key:', TUMA_CONFIG.API_KEY ? '✅ Set' : '❌ Missing');
+console.log('   API URL:', TUMA_CONFIG.API_URL);
 
 // ============================================================
 //  TUMA API FUNCTIONS
 // ============================================================
 
 async function getTumaToken() {
-    if (!TUMA_CONFIG.ENABLED || !TUMA_CONFIG.EMAIL || !TUMA_CONFIG.API_KEY) {
+    if (!TUMA_CONFIG.ENABLED) {
+        console.warn('⚠️ Tuma payments are disabled. Check TUMA_ENABLED env var.');
         throw new Error('Tuma payments are disabled.');
     }
     
+    if (!TUMA_CONFIG.EMAIL || !TUMA_CONFIG.API_KEY) {
+        console.error('❌ Tuma credentials missing. Check TUMA_EMAIL and TUMA_API_KEY env vars.');
+        throw new Error('Tuma credentials not configured.');
+    }
+    
     try {
+        console.log('🔑 Getting Tuma token...');
         const response = await fetch(`${TUMA_CONFIG.API_URL}/auth/token`, {
             method: 'POST',
             headers: { 
@@ -337,108 +346,26 @@ async function getTumaToken() {
         });
         
         const responseText = await response.text();
+        console.log('📥 Tuma token response status:', response.status);
+        
         if (!response.ok) {
-            throw new Error(`Tuma auth failed: ${response.status}`);
+            console.error('❌ Tuma auth failed:', responseText);
+            throw new Error(`Tuma auth failed: ${response.status} - ${responseText}`);
         }
         
         const data = JSON.parse(responseText);
         const token = data.token || data.access_token || data.data?.token;
         if (!token) {
+            console.error('❌ No token in response:', data);
             throw new Error('No token received from Tuma');
         }
+        console.log('✅ Tuma token obtained successfully');
         return token;
     } catch (error) {
         console.error('❌ Tuma token error:', error.message);
         throw error;
     }
 }
-
-async function initiateTumaPayment(phone, amount, description, reference) {
-    if (!TUMA_CONFIG.ENABLED) {
-        throw new Error('Tuma payments are disabled.');
-    }
-    
-    try {
-        const token = await getTumaToken();
-        const cleanPhone = phone.replace(/[^0-9]/g, '');
-        let formattedPhone;
-        if (cleanPhone.startsWith('0')) {
-            formattedPhone = '254' + cleanPhone.slice(1);
-        } else if (cleanPhone.startsWith('254')) {
-            formattedPhone = cleanPhone;
-        } else {
-            formattedPhone = '254' + cleanPhone;
-        }
-        
-        const payload = {
-            amount: amount,
-            phone: formattedPhone,
-            callback_url: TUMA_CONFIG.CALLBACK_URL,
-            description: description || 'HotBook Payment'
-        };
-        
-        const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/stk-push`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            body: JSON.stringify(payload)
-        });
-        
-        const responseText = await response.text();
-        if (!response.ok) {
-            throw new Error(`Payment request failed: ${response.status}`);
-        }
-        
-        const result = JSON.parse(responseText);
-        const transactionId = result.transaction_id || result.data?.transaction_id || 'pending';
-        
-        return {
-            success: true,
-            transaction_id: transactionId,
-            raw_response: result
-        };
-    } catch (error) {
-        console.error('❌ Tuma payment error:', error.message);
-        throw error;
-    }
-}
-
-async function checkTumaPaymentStatus(transactionId) {
-    if (!TUMA_CONFIG.ENABLED) {
-        return { status: 'pending', paid: false };
-    }
-    
-    try {
-        const token = await getTumaToken();
-        const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/status/${transactionId}`, {
-            method: 'GET',
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
-        });
-        
-        if (!response.ok) {
-            return { status: 'pending', paid: false };
-        }
-        
-        const result = await response.json();
-        const status = result.status || result.data?.status || 'pending';
-        return {
-            status: status,
-            paid: status === 'completed' || status === 'paid' || status === 'success',
-            ...result
-        };
-    } catch (error) {
-        console.error('❌ Tuma status check error:', error.message);
-        return { status: 'pending', paid: false };
-    }
-}
-
 // ============================================================
 //  MIDDLEWARE
 // ============================================================
@@ -1190,14 +1117,9 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
             console.error('❌ Unlock payment processing error:', error);
         }
     }
-}
-
-// ============================================================
-//  INITIATE UNLOCK PAYMENT
-// ============================================================
-
-app.post('/api/payments/unlock', async (req, res) => {
+    app.post('/api/payments/unlock', async (req, res) => {
     console.log('\n🚀 [API] Unlock payment request received');
+    console.log('📥 Request body:', JSON.stringify(req.body, null, 2));
     
     try {
         const { hotel_id, phone } = req.body;
@@ -1215,6 +1137,7 @@ app.post('/api/payments/unlock', async (req, res) => {
             return res.status(400).json({ error: 'Please enter a valid phone number (e.g., 0712345678)' });
         }
         
+        // Check if already paid
         const existing = await pool.query(
             'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2 AND paid = TRUE AND expires_at > NOW()',
             [clientId, hotel_id]
@@ -1228,29 +1151,37 @@ app.post('/api/payments/unlock', async (req, res) => {
             });
         }
         
+        // Check if TUMA is enabled
         if (!TUMA_CONFIG.ENABLED) {
-            return res.json({
+            console.error('❌ TUMA payments are disabled');
+            return res.status(400).json({
                 success: false,
-                message: 'Tuma payments are currently disabled.'
+                error: 'Tuma payments are currently disabled. Please contact support.'
             });
         }
         
-        const reference = `UNLOCK-${hotel_id}-${clientId}`;
+        const reference = `UNLOCK-${hotel_id}-${clientId}-${Date.now().toString().slice(-6)}`;
         const description = `Unlock hotel ${hotel_id} for client ${clientId}`;
         
-        const payment = await initiateTumaPayment(phone, 100, description, reference);
+        console.log('📤 Calling Tuma payment with:', { phone: cleanPhone, amount: 100, reference });
+        
+        const payment = await initiateTumaPayment(cleanPhone, 100, description, reference);
         
         if (!payment.success) {
+            console.error('❌ Tuma payment failed:', payment.message);
             return res.status(400).json({ 
-                error: payment.message || 'Payment initiation failed' 
+                error: payment.message || 'Payment initiation failed. Please try again.'
             });
         }
         
+        // Store pending payment
         await pool.query(
             `INSERT INTO pending_payments (client_id, hotel_id, amount, reference, transaction_id, status)
              VALUES ($1, $2, $3, $4, $5, 'pending')`,
             [clientId, hotel_id, 100, reference, payment.transaction_id]
         );
+        
+        console.log('✅ Unlock payment initiated successfully');
         
         res.json({
             success: true,
@@ -3038,10 +2969,6 @@ app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
     }
 });
 
-// ============================================================
-//  FIXED MY BOOKINGS - Include all bookings
-// ============================================================
-
 app.get('/api/my-bookings', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
@@ -3052,9 +2979,11 @@ app.get('/api/my-bookings', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
 
+        console.log(`📋 Fetching bookings for client: ${clientId}`);
+
         // Unlocked hotels
         const unlocked = await pool.query(
-            `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at
+            `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at, p.amount
              FROM payments p
              JOIN hotels h ON p.hotel_id = h.id
              WHERE p.client_id = $1 AND p.paid = TRUE AND p.expires_at > NOW()
@@ -3062,11 +2991,12 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Room bookings - include ALL bookings for this client
+        // Room bookings - ALL bookings for this client
         const roomBookings = await pool.query(
             `SELECT rb.*, 
                     COALESCE(r.room_type_name, 'Unknown') as room_type_name, 
-                    COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
+                    COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name,
+                    h.hotel_name as hotel_name
              FROM room_bookings rb
              LEFT JOIN rooms r ON rb.room_type_id = r.id
              LEFT JOIN hotels h ON rb.hotel_id = h.id
@@ -3075,7 +3005,7 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Food orders - include ALL orders for this client
+        // Food orders - ALL orders for this client
         const foodOrders = await pool.query(
             `SELECT fo.*, COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
              FROM food_orders fo
@@ -3084,6 +3014,8 @@ app.get('/api/my-bookings', async (req, res) => {
              ORDER BY fo.created_at DESC`,
             [clientId]
         );
+
+        console.log(`📋 Found ${unlocked.rows.length} unlocked, ${roomBookings.rows.length} room bookings, ${foodOrders.rows.length} food orders`);
 
         res.json({
             unlocked_hotels: unlocked.rows || [],
@@ -3094,24 +3026,19 @@ app.get('/api/my-bookings', async (req, res) => {
             }))
         });
     } catch (error) {
-        console.error('My bookings error:', error);
+        console.error('❌ My bookings error:', error);
         res.json({ unlocked_hotels: [], room_bookings: [], food_orders: [] });
     }
 });
 
-// ============================================================
-//  FIXED TUMA PAYMENT - Better error handling
-// ============================================================
-
-async function initiateTumaPayment(phone, amount, description, reference) {
+ async function initiateTumaPayment(phone, amount, description, reference) {
+    console.log(`📤 Initiating Tuma payment: ${amount} KES to ${phone}`);
+    
     if (!TUMA_CONFIG.ENABLED) {
-        // Fallback: Return success with mock transaction for testing
-        console.log('⚠️ Tuma payments disabled - using mock payment');
+        console.error('❌ Tuma payments are disabled');
         return {
-            success: true,
-            transaction_id: 'MOCK-' + Date.now(),
-            mock: true,
-            message: 'Tuma payments are disabled. This is a mock payment for testing.'
+            success: false,
+            message: 'Tuma payments are disabled. Please check server configuration.'
         };
     }
     
@@ -3134,7 +3061,7 @@ async function initiateTumaPayment(phone, amount, description, reference) {
             description: description || 'HotBook Payment'
         };
         
-        console.log('📤 Tuma payment request:', JSON.stringify(payload, null, 2));
+        console.log('📤 Tuma payment payload:', JSON.stringify(payload, null, 2));
         
         const response = await fetch(`${TUMA_CONFIG.API_URL}/payment/stk-push`, {
             method: 'POST',
@@ -3147,20 +3074,24 @@ async function initiateTumaPayment(phone, amount, description, reference) {
         });
         
         const responseText = await response.text();
-        console.log('📥 Tuma response:', responseText);
+        console.log('📥 Tuma response status:', response.status);
+        console.log('📥 Tuma response body:', responseText);
         
         if (!response.ok) {
-            // Check if it's a known error
+            let errorMsg = `Payment request failed: ${response.status}`;
             try {
                 const errorData = JSON.parse(responseText);
-                throw new Error(errorData.message || errorData.error || `HTTP ${response.status}`);
+                errorMsg = errorData.message || errorData.error || errorMsg;
             } catch (parseError) {
-                throw new Error(`Payment request failed: ${response.status}`);
+                // Use default error message
             }
+            throw new Error(errorMsg);
         }
         
         const result = JSON.parse(responseText);
         const transactionId = result.transaction_id || result.data?.transaction_id || 'pending';
+        
+        console.log('✅ Tuma payment initiated, transaction_id:', transactionId);
         
         return {
             success: true,
@@ -3169,13 +3100,13 @@ async function initiateTumaPayment(phone, amount, description, reference) {
         };
     } catch (error) {
         console.error('❌ Tuma payment error:', error.message);
-        // Don't throw - return error object
         return {
             success: false,
             message: error.message || 'Payment initiation failed'
         };
     }
-}
+}   
+
 // ============================================================
 //  START SERVER
 // ============================================================
