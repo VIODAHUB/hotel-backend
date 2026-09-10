@@ -160,6 +160,7 @@ async function createTables() {
                 payment_verified_at TIMESTAMP,
                 booking_reference VARCHAR(255) UNIQUE,
                 status VARCHAR(50) DEFAULT 'pending',
+                booking_source VARCHAR(50) DEFAULT 'online',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -186,11 +187,21 @@ async function createTables() {
                 payment_verified_at TIMESTAMP,
                 booking_reference VARCHAR(255) UNIQUE,
                 status VARCHAR(50) DEFAULT 'pending',
+                booking_source VARCHAR(50) DEFAULT 'online',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
         console.log('✅ Food orders table ready');
+
+        // Add booking_source columns if they don't exist (for existing DBs)
+        await client.query(`
+            DO $$ BEGIN
+                ALTER TABLE room_bookings ADD COLUMN IF NOT EXISTS booking_source VARCHAR(50) DEFAULT 'online';
+                ALTER TABLE food_orders ADD COLUMN IF NOT EXISTS booking_source VARCHAR(50) DEFAULT 'online';
+            EXCEPTION WHEN OTHERS THEN NULL;
+            END $$;
+        `);
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS payments (
@@ -237,7 +248,7 @@ async function createTables() {
         `);
         console.log('✅ Reviews table ready');
 
-        // Add payment_codes table - CRITICAL for issue #3
+        // Payment codes table
         await client.query(`
             CREATE TABLE IF NOT EXISTS payment_codes (
                 id SERIAL PRIMARY KEY,
@@ -256,6 +267,40 @@ async function createTables() {
             )
         `);
         console.log('✅ Payment codes table ready');
+
+        // ============================================================
+        //  RECEIPTS TABLE (NEW - stores all receipts for reprint)
+        // ============================================================
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS receipts (
+                id SERIAL PRIMARY KEY,
+                hotel_id INTEGER REFERENCES hotels(id) ON DELETE CASCADE,
+                booking_id INTEGER,
+                order_id INTEGER,
+                receipt_type VARCHAR(50) NOT NULL,
+                receipt_source VARCHAR(50) NOT NULL DEFAULT 'walk-in',
+                booking_reference VARCHAR(255) NOT NULL,
+                client_name VARCHAR(255),
+                client_phone VARCHAR(50),
+                hotel_name VARCHAR(255),
+                item_description TEXT,
+                check_in_date DATE,
+                check_out_date DATE,
+                pickup_date DATE,
+                pickup_time TIME,
+                nights INTEGER,
+                number_of_guests INTEGER,
+                price_per_night DECIMAL(10,2),
+                total_amount DECIMAL(10,2) NOT NULL,
+                payment_method VARCHAR(50) DEFAULT 'cash',
+                payment_status VARCHAR(50) DEFAULT 'paid',
+                special_notes TEXT,
+                receipt_data JSONB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        console.log('✅ Receipts table ready');
 
         console.log('✅ All database tables are ready!');
         
@@ -522,6 +567,56 @@ const isHotelOwner = async (req, res, next) => {
 };
 
 // ============================================================
+//  SUBSCRIPTION CHECK MIDDLEWARE (NEW)
+//  Blocks walk-in endpoints if both subscription AND featured expired
+// ============================================================
+
+const requireActiveSubscription = async (req, res, next) => {
+    try {
+        const hotelId = parseInt(
+            req.body?.hotel_id ||
+            req.body?.hotelId ||
+            req.params?.hotelId ||
+            req.params?.hotel_id
+        );
+
+        if (!hotelId) {
+            return res.status(400).json({ error: 'Hotel ID is required' });
+        }
+
+        const check = await pool.query(
+            'SELECT id, hotel_name, subscription_expiry, featured_expiry FROM hotels WHERE id = $1 AND user_id = $2',
+            [hotelId, req.userId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this hotel' });
+        }
+
+        const hotel = check.rows[0];
+        const now = new Date();
+        const subExpiry = hotel.subscription_expiry ? new Date(hotel.subscription_expiry) : null;
+        const featExpiry = hotel.featured_expiry ? new Date(hotel.featured_expiry) : null;
+
+        const subActive = subExpiry && subExpiry > now;
+        const featActive = featExpiry && featExpiry > now;
+
+        if (!subActive && !featActive) {
+            return res.status(403).json({
+                error: 'Your subscription has expired. Please subscribe to restore all services.',
+                subscription_expired: true,
+                hotel_name: hotel.hotel_name
+            });
+        }
+
+        req.hotel = hotel;
+        next();
+    } catch (error) {
+        console.error('❌ Subscription check error:', error);
+        res.status(500).json({ error: 'Failed to verify subscription status' });
+    }
+};
+
+// ============================================================
 //  HELPER FUNCTIONS
 // ============================================================
 
@@ -550,6 +645,38 @@ const isHotelFeatured = async (hotelId) => {
     const expiry = new Date(hotel.featured_expiry);
     return expiry > new Date();
 };
+
+// ============================================================
+//  BOOKING SORT HELPER (NEW)
+//  Order: nearest upcoming → furthest upcoming → past (bottom)
+// ============================================================
+
+function sortBookingsByDate(bookings, dateField) {
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+
+    return [...bookings].sort((a, b) => {
+        const dateA = a[dateField] ? new Date(a[dateField]) : null;
+        const dateB = b[dateField] ? new Date(b[dateField]) : null;
+
+        if (!dateA && !dateB) return 0;
+        if (!dateA) return 1;
+        if (!dateB) return -1;
+
+        const isPastA = dateA < now;
+        const isPastB = dateB < now;
+
+        // Past bookings go to bottom
+        if (isPastA && !isPastB) return 1;
+        if (!isPastA && isPastB) return -1;
+
+        // Both past: most recent past first
+        if (isPastA && isPastB) return dateB - dateA;
+
+        // Both upcoming: nearest first
+        return dateA - dateB;
+    });
+}
 
 async function getRoomAvailability(hotelId, checkInDate, checkOutDate) {
     const roomsResult = await pool.query(
@@ -807,8 +934,87 @@ app.put('/api/hotels/owner/:id/payment-details', isHotelOwner, async (req, res) 
 });
 
 // ============================================================
+//  RECEIPTS API (NEW)
+// ============================================================
+
+// Save a receipt
+app.post('/api/receipts', isHotelOwner, async (req, res) => {
+    try {
+        const {
+            hotel_id, booking_id, order_id, receipt_type, receipt_source,
+            booking_reference, client_name, client_phone,
+            item_description, check_in_date, check_out_date, pickup_date, pickup_time,
+            nights, number_of_guests, price_per_night, total_amount,
+            payment_method, payment_status, special_notes, receipt_data
+        } = req.body;
+
+        const hotelResult = await pool.query('SELECT hotel_name FROM hotels WHERE id = $1', [hotel_id]);
+        const hotelName = hotelResult.rows[0]?.hotel_name || 'Hotel';
+
+        const result = await pool.query(
+            `INSERT INTO receipts 
+                (hotel_id, booking_id, order_id, receipt_type, receipt_source,
+                 booking_reference, client_name, client_phone, hotel_name,
+                 item_description, check_in_date, check_out_date, pickup_date, pickup_time,
+                 nights, number_of_guests, price_per_night, total_amount,
+                 payment_method, payment_status, special_notes, receipt_data)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+             RETURNING *`,
+            [
+                hotel_id, booking_id || null, order_id || null, receipt_type, receipt_source || 'walk-in',
+                booking_reference, client_name || null, client_phone || null, hotelName,
+                item_description || null, check_in_date || null, check_out_date || null,
+                pickup_date || null, pickup_time || null,
+                nights || null, number_of_guests || null, price_per_night || null, total_amount || 0,
+                payment_method || 'cash', payment_status || 'paid', special_notes || null,
+                receipt_data ? JSON.stringify(receipt_data) : null
+            ]
+        );
+        res.status(201).json({ success: true, receipt: result.rows[0] });
+    } catch (error) {
+        console.error('Error saving receipt:', error);
+        res.status(500).json({ error: 'Failed to save receipt: ' + error.message });
+    }
+});
+
+// Get all receipts for a hotel (owner view)
+app.get('/api/hotels/owner/:hotelId/receipts', isHotelOwner, async (req, res) => {
+    const hotelId = parseInt(req.params.hotelId);
+    try {
+        const check = await pool.query('SELECT id FROM hotels WHERE id = $1 AND user_id = $2', [hotelId, req.userId]);
+        if (check.rows.length === 0) return res.status(403).json({ error: 'You do not own this hotel' });
+
+        const result = await pool.query(
+            `SELECT * FROM receipts WHERE hotel_id = $1 ORDER BY created_at DESC`,
+            [hotelId]
+        );
+        res.json({ receipts: result.rows || [] });
+    } catch (error) {
+        console.error('Error fetching receipts:', error);
+        res.status(500).json({ error: 'Failed to fetch receipts' });
+    }
+});
+
+// Get single receipt by ID
+app.get('/api/receipts/:id', isHotelOwner, async (req, res) => {
+    const id = parseInt(req.params.id);
+    try {
+        const result = await pool.query(
+            `SELECT r.*, h.user_id FROM receipts r JOIN hotels h ON r.hotel_id = h.id WHERE r.id = $1`,
+            [id]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Receipt not found' });
+        if (result.rows[0].user_id !== req.userId) return res.status(403).json({ error: 'Access denied' });
+        res.json(result.rows[0]);
+    } catch (error) {
+        console.error('Error fetching receipt:', error);
+        res.status(500).json({ error: 'Failed to fetch receipt' });
+    }
+});
+
+// ============================================================
 //  PAYMENT VERIFICATION
-//=============================================================
+// ============================================================
 app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
     const bookingId = parseInt(req.params.id);
     const { confirmation_code, payment_method } = req.body;
@@ -863,6 +1069,32 @@ app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
             [booking.hotel_id, bookingId, clientName, clientPhone, 
              formattedCode, booking.total_amount, booking.booking_reference]
         );
+
+        // Auto-save an online receipt (NEW)
+        try {
+            const roomInfo = await pool.query('SELECT room_type_name FROM rooms WHERE id = $1', [booking.room_type_id]);
+            const roomName = roomInfo.rows[0]?.room_type_name || 'Room';
+            const nights = Math.ceil((new Date(booking.check_out_date) - new Date(booking.check_in_date)) / (1000 * 60 * 60 * 24));
+            
+            await pool.query(
+                `INSERT INTO receipts 
+                    (hotel_id, booking_id, receipt_type, receipt_source, booking_reference,
+                     client_name, client_phone, hotel_name, item_description,
+                     check_in_date, check_out_date, nights, number_of_guests,
+                     total_amount, payment_method, payment_status)
+                 VALUES ($1,$2,'room','online',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'paid')`,
+                [
+                    booking.hotel_id, bookingId, booking.booking_reference,
+                    clientName, clientPhone, booking.hotel_name,
+                    `${roomName} (${nights} nights)`,
+                    booking.check_in_date, booking.check_out_date,
+                    nights, booking.number_of_guests || 1,
+                    booking.total_amount, payment_method || 'mpesa'
+                ]
+            );
+        } catch (e) {
+            console.warn('⚠️ Could not auto-save receipt for room booking:', e.message);
+        }
         
         console.log('✅ Payment verified for booking:', bookingId, 'Code:', formattedCode);
         
@@ -1156,7 +1388,7 @@ async function processSuccessfulUnlockPayment(transactionId, data) {
 }
 
 // ============================================================
-//  UNLOCK PAYMENT ENDPOINT (Fixed - complete implementation)
+//  UNLOCK PAYMENT ENDPOINT
 // ============================================================
 
 app.post('/api/payments/unlock', async (req, res) => {
@@ -1376,7 +1608,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
 });
 
 // ============================================================
-//  MY BOOKINGS
+//  MY BOOKINGS (SORTED - NEW)
 // ============================================================
 
 app.get('/api/my-bookings', async (req, res) => {
@@ -1409,8 +1641,7 @@ app.get('/api/my-bookings', async (req, res) => {
              FROM room_bookings rb
              LEFT JOIN rooms r ON rb.room_type_id = r.id
              LEFT JOIN hotels h ON rb.hotel_id = h.id
-             WHERE rb.client_id = $1
-             ORDER BY rb.created_at DESC`,
+             WHERE rb.client_id = $1`,
             [clientId]
         );
 
@@ -1419,17 +1650,20 @@ app.get('/api/my-bookings', async (req, res) => {
             `SELECT fo.*, COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
              FROM food_orders fo
              LEFT JOIN hotels h ON fo.hotel_id = h.id
-             WHERE fo.client_id = $1
-             ORDER BY fo.created_at DESC`,
+             WHERE fo.client_id = $1`,
             [clientId]
         );
 
-        console.log(`📋 [MY BOOKINGS] Found: ${unlocked.rows.length} unlocked, ${roomBookings.rows.length} room bookings, ${foodOrders.rows.length} food orders`);
+        // Apply sort: nearest upcoming → furthest upcoming → past (bottom)
+        const sortedRoomBookings = sortBookingsByDate(roomBookings.rows, 'check_in_date');
+        const sortedFoodOrders = sortBookingsByDate(foodOrders.rows, 'pickup_date');
+
+        console.log(`📋 [MY BOOKINGS] Found: ${unlocked.rows.length} unlocked, ${sortedRoomBookings.length} room bookings, ${sortedFoodOrders.length} food orders`);
 
         res.json({
             unlocked_hotels: unlocked.rows || [],
-            room_bookings: roomBookings.rows || [],
-            food_orders: foodOrders.rows.map(o => ({
+            room_bookings: sortedRoomBookings,
+            food_orders: sortedFoodOrders.map(o => ({
                 ...o,
                 items: typeof o.items === 'string' ? JSON.parse(o.items) : (o.items || [])
             }))
@@ -1460,8 +1694,8 @@ app.post('/api/food-orders', async (req, res) => {
         const bookingRef = 'FOOD-' + Date.now().toString().slice(-8);
 
         const result = await pool.query(
-            `INSERT INTO food_orders (client_id, hotel_id, items, total_amount, pickup_date, pickup_time, special_instructions, payment_status, booking_reference)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+            `INSERT INTO food_orders (client_id, hotel_id, items, total_amount, pickup_date, pickup_time, special_instructions, payment_status, booking_reference, booking_source)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, 'online')
              RETURNING *`,
             [clientId, hotel_id, JSON.stringify(items), total, pickup_date, pickup_time, special_instructions || '', bookingRef]
         );
@@ -1472,7 +1706,8 @@ app.post('/api/food-orders', async (req, res) => {
     }
 });
 
-app.post('/api/food-orders/walk-in', isHotelOwner, async (req, res) => {
+// WALK-IN FOOD ORDER (with subscription check - NEW)
+app.post('/api/food-orders/walk-in', isHotelOwner, requireActiveSubscription, async (req, res) => {
     try {
         const { hotel_id, items, pickup_date, pickup_time, client_name, client_phone, special_instructions } = req.body;
         
@@ -1481,8 +1716,8 @@ app.post('/api/food-orders/walk-in', isHotelOwner, async (req, res) => {
         const bookingRef = 'WFOOD-' + Date.now().toString().slice(-8);
 
         const result = await pool.query(
-            `INSERT INTO food_orders (hotel_id, client_name, client_phone, items, total_amount, pickup_date, pickup_time, special_instructions, payment_status, booking_reference, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'paid', $9, 'confirmed')
+            `INSERT INTO food_orders (hotel_id, client_name, client_phone, items, total_amount, pickup_date, pickup_time, special_instructions, payment_status, booking_reference, status, booking_source)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'paid', $9, 'confirmed', 'walk-in')
              RETURNING *`,
             [hotel_id, client_name, client_phone, JSON.stringify(items), total, pickup_date, pickup_time, special_instructions || '', bookingRef]
         );
@@ -1527,7 +1762,7 @@ app.get('/api/food-orders/:id', async (req, res) => {
 });
 
 // ============================================================
-//  FIXED FOOD ORDER - Store payment code properly
+//  FOOD ORDER PAYMENT VERIFICATION (with auto receipt)
 // ============================================================
 app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
     const orderId = parseInt(req.params.id);
@@ -1582,6 +1817,29 @@ app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
             [order.hotel_id, orderId, clientName, clientPhone, 
              formattedCode, order.total_amount, order.booking_reference]
         );
+
+        // Auto-save an online receipt (NEW)
+        try {
+            const items = typeof order.items === 'string' ? JSON.parse(order.items) : order.items;
+            const itemNames = (items || []).map(i => `${i.name} x${i.quantity}`).join(', ');
+            
+            await pool.query(
+                `INSERT INTO receipts 
+                    (hotel_id, order_id, receipt_type, receipt_source, booking_reference,
+                     client_name, client_phone, hotel_name, item_description,
+                     pickup_date, pickup_time, total_amount, payment_method, payment_status)
+                 VALUES ($1,$2,'food','online',$3,$4,$5,$6,$7,$8,$9,$10,$11,'paid')`,
+                [
+                    order.hotel_id, orderId, order.booking_reference,
+                    clientName, clientPhone, order.hotel_name,
+                    itemNames || 'Food Order',
+                    order.pickup_date, order.pickup_time,
+                    order.total_amount, payment_method || 'mpesa'
+                ]
+            );
+        } catch (e) {
+            console.warn('⚠️ Could not auto-save receipt for food order:', e.message);
+        }
         
         console.log('✅ Payment verified for food order:', orderId, 'Code:', formattedCode);
         
@@ -1646,8 +1904,8 @@ app.post('/api/room-bookings', async (req, res) => {
 
         const result = await pool.query(
             `INSERT INTO room_bookings (client_id, hotel_id, room_type_id, check_in_date, check_out_date, 
-                number_of_guests, total_amount, special_requests, payment_status, booking_reference, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, 'pending')
+                number_of_guests, total_amount, special_requests, payment_status, booking_reference, status, booking_source)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, 'pending', 'online')
              RETURNING *`,
             [clientId, room.rows[0].hotel_id, room_type_id, check_in_date, check_out_date, 
              number_of_guests || 1, total, special_requests || '', bookingRef]
@@ -1661,7 +1919,8 @@ app.post('/api/room-bookings', async (req, res) => {
     }
 });
 
-app.post('/api/room-bookings/walk-in', isHotelOwner, async (req, res) => {
+// WALK-IN ROOM BOOKING (with subscription check - NEW)
+app.post('/api/room-bookings/walk-in', isHotelOwner, requireActiveSubscription, async (req, res) => {
     try {
         const { hotel_id, room_type_id, check_in_date, check_out_date, number_of_guests, client_name, client_phone, special_requests } = req.body;
         
@@ -1694,8 +1953,8 @@ app.post('/api/room-bookings/walk-in', isHotelOwner, async (req, res) => {
 
         const result = await pool.query(
             `INSERT INTO room_bookings (hotel_id, room_type_id, client_name, client_phone, check_in_date, check_out_date, 
-                number_of_guests, total_amount, special_requests, payment_status, booking_reference, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'paid', $10, 'confirmed')
+                number_of_guests, total_amount, special_requests, payment_status, booking_reference, status, booking_source)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'paid', $10, 'confirmed', 'walk-in')
              RETURNING *`,
             [hotel_id, room_type_id, client_name, client_phone, check_in_date, check_out_date, number_of_guests || 1, total, special_requests || '', bookingRef]
         );
@@ -2399,7 +2658,7 @@ app.delete('/api/admin/users/:id', isAdmin, async (req, res) => {
 });
 
 // ============================================================
-//  HOTEL OWNER ROUTES
+//  HOTEL OWNER ROUTES (SORTED - NEW)
 // ============================================================
 
 app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
@@ -2457,23 +2716,24 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
         const today = new Date().toISOString().split('T')[0];
         const stats = await getDateSpecificStats(hotelId, today);
 
-        const roomBookings = await pool.query(
+        const roomBookingsRaw = await pool.query(
             `SELECT rb.*, COALESCE(r.room_type_name, 'Unknown') as room_type_name 
              FROM room_bookings rb
              LEFT JOIN rooms r ON rb.room_type_id = r.id
-             WHERE rb.hotel_id = $1 AND rb.status = 'confirmed'
-             ORDER BY rb.check_in_date DESC`,
+             WHERE rb.hotel_id = $1 AND rb.status = 'confirmed'`,
             [hotelId]
         );
 
-        const foodOrders = await pool.query(
+        const foodOrdersRaw = await pool.query(
             `SELECT * FROM food_orders 
-             WHERE hotel_id = $1 AND status = 'confirmed'
-             ORDER BY pickup_date DESC`,
+             WHERE hotel_id = $1 AND status = 'confirmed'`,
             [hotelId]
         );
 
-        // Get payment codes for this hotel
+        // Sort: nearest upcoming → furthest upcoming → past (bottom)
+        const sortedRoomBookings = sortBookingsByDate(roomBookingsRaw.rows, 'check_in_date');
+        const sortedFoodOrders = sortBookingsByDate(foodOrdersRaw.rows, 'pickup_date');
+
         const paymentCodes = await pool.query(
             `SELECT pc.*, rb.booking_reference as room_booking_ref, fo.booking_reference as food_order_ref
              FROM payment_codes pc
@@ -2502,8 +2762,8 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             ...hotel,
             subscription_days_left: subscriptionDaysLeft,
             featured_days_left: featuredDaysLeft,
-            room_bookings: roomBookings.rows || [],
-            food_orders: foodOrders.rows || [],
+            room_bookings: sortedRoomBookings,
+            food_orders: sortedFoodOrders,
             payment_codes: paymentCodes.rows || [],
             room_stats: {
                 total_rooms: stats.total_rooms,
@@ -2870,10 +3130,9 @@ app.get('/api/hotels/:id', async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT CODES ROUTES - Store and retrieve M-Pesa codes
+//  PAYMENT CODES ROUTES
 // ============================================================
 
-// Save a payment code from a client booking
 app.post('/api/payment-codes', async (req, res) => {
     const { hotel_id, booking_id, order_id, client_name, client_phone, confirmation_code, amount, booking_reference } = req.body;
     
@@ -2898,7 +3157,6 @@ app.post('/api/payment-codes', async (req, res) => {
     }
 });
 
-// Get payment codes for a hotel (owner only)
 app.get('/api/hotels/owner/:hotelId/payment-codes', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     
@@ -2936,12 +3194,10 @@ app.get('/api/hotels/owner/:hotelId/payment-codes', isHotelOwner, async (req, re
     }
 });
 
-// Verify a payment code (owner marks as verified)
 app.put('/api/payments/verify-code/:codeId', isHotelOwner, async (req, res) => {
     const codeId = parseInt(req.params.codeId);
     
     try {
-        // Verify the owner owns the hotel associated with this code
         const check = await pool.query(
             `SELECT pc.hotel_id FROM payment_codes pc 
              WHERE pc.id = $1`,
