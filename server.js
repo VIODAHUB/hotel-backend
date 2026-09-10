@@ -268,9 +268,7 @@ async function createTables() {
         `);
         console.log('✅ Payment codes table ready');
 
-        // ============================================================
-        //  RECEIPTS TABLE (NEW - stores all receipts for reprint)
-        // ============================================================
+        // Receipts table
         await client.query(`
             CREATE TABLE IF NOT EXISTS receipts (
                 id SERIAL PRIMARY KEY,
@@ -567,7 +565,7 @@ const isHotelOwner = async (req, res, next) => {
 };
 
 // ============================================================
-//  SUBSCRIPTION CHECK MIDDLEWARE (NEW)
+//  SUBSCRIPTION CHECK MIDDLEWARE
 //  Blocks walk-in endpoints if both subscription AND featured expired
 // ============================================================
 
@@ -647,7 +645,7 @@ const isHotelFeatured = async (hotelId) => {
 };
 
 // ============================================================
-//  BOOKING SORT HELPER (NEW)
+//  BOOKING SORT HELPER
 //  Order: nearest upcoming → furthest upcoming → past (bottom)
 // ============================================================
 
@@ -934,7 +932,7 @@ app.put('/api/hotels/owner/:id/payment-details', isHotelOwner, async (req, res) 
 });
 
 // ============================================================
-//  RECEIPTS API (NEW)
+//  RECEIPTS API
 // ============================================================
 
 // Save a receipt
@@ -1013,7 +1011,7 @@ app.get('/api/receipts/:id', isHotelOwner, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT VERIFICATION
+//  PAYMENT VERIFICATION (Room)
 // ============================================================
 app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
     const bookingId = parseInt(req.params.id);
@@ -1045,7 +1043,6 @@ app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
         
         const formattedCode = confirmation_code.toUpperCase();
         
-        // Update the booking
         await pool.query(
             `UPDATE room_bookings SET 
                 payment_confirmation_code = $1,
@@ -1058,7 +1055,6 @@ app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
             [formattedCode, payment_method || 'mpesa', bookingId]
         );
         
-        // Store payment code in the payment_codes table
         const clientName = booking.client_name || 'Guest';
         const clientPhone = booking.client_phone || '';
         
@@ -1070,7 +1066,7 @@ app.post('/api/room-bookings/:id/verify-payment', async (req, res) => {
              formattedCode, booking.total_amount, booking.booking_reference]
         );
 
-        // Auto-save an online receipt (NEW)
+        // Auto-save an online receipt
         try {
             const roomInfo = await pool.query('SELECT room_type_name FROM rooms WHERE id = $1', [booking.room_type_id]);
             const roomName = roomInfo.rows[0]?.room_type_name || 'Room';
@@ -1125,6 +1121,9 @@ app.get('/api/payments/subscription/details', async (req, res) => {
     });
 });
 
+// ============================================================
+//  INITIATE SUBSCRIPTION (updated message)
+// ============================================================
 app.post('/api/payments/subscription/initiate/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     const { amount } = req.body;
@@ -1144,16 +1143,29 @@ app.post('/api/payments/subscription/initiate/:hotelId', isHotelOwner, async (re
         const reference = `SUB-${hotelId}-${Date.now().toString().slice(-6)}`;
         
         const currentSub = await pool.query(
-            'SELECT subscription_expiry FROM hotels WHERE id = $1',
+            'SELECT subscription_expiry, featured_expiry FROM hotels WHERE id = $1',
             [hotelId]
         );
         
-        const currentExpiry = currentSub.rows[0]?.subscription_expiry;
+        const currentSubExpiry = currentSub.rows[0]?.subscription_expiry;
+        const currentFeatExpiry = currentSub.rows[0]?.featured_expiry;
         const now = new Date();
         
         let expiryMessage = '';
-        if (currentExpiry && new Date(currentExpiry) > now) {
-            expiryMessage = `Current subscription expires on ${new Date(currentExpiry).toLocaleDateString()}. This payment will extend it by 30 days.`;
+        if (isFeatured) {
+            const featActive = currentFeatExpiry && new Date(currentFeatExpiry) > now;
+            if (featActive) {
+                expiryMessage = `Your featured period expires on ${new Date(currentFeatExpiry).toLocaleDateString()}. This payment will extend it by 30 days. Your subscription timer runs independently.`;
+            } else {
+                expiryMessage = `This payment will activate 30 days of featured status. Your subscription timer runs independently.`;
+            }
+        } else {
+            const subActive = currentSubExpiry && new Date(currentSubExpiry) > now;
+            if (subActive) {
+                expiryMessage = `Your subscription expires on ${new Date(currentSubExpiry).toLocaleDateString()}. This payment will extend it by 30 days.`;
+            } else {
+                expiryMessage = `This payment will activate 30 days of subscription. Your featured timer runs independently.`;
+            }
         }
         
         res.json({
@@ -1167,7 +1179,7 @@ app.post('/api/payments/subscription/initiate/:hotelId', isHotelOwner, async (re
                 reference: reference,
                 is_featured: isFeatured,
                 hotel_name: hotel.hotel_name,
-                current_expiry: currentExpiry,
+                current_expiry: currentSubExpiry,
                 expiry_message: expiryMessage
             }
         });
@@ -1177,6 +1189,9 @@ app.post('/api/payments/subscription/initiate/:hotelId', isHotelOwner, async (re
     }
 });
 
+// ============================================================
+//  VERIFY SUBSCRIPTION (CORRECTED: independent timers)
+// ============================================================
 app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req, res) => {
     const hotelId = parseInt(req.params.hotelId);
     const { confirmation_code, reference, amount } = req.body;
@@ -1203,50 +1218,83 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
         
         const now = new Date();
         const days = 30;
-        let subscriptionExpiry, featuredExpiry;
+        let subscriptionExpiry = null;
+        let featuredExpiry = null;
         let isFeatured = false;
         let message = '';
         
+        // Fetch current state
         const currentData = await pool.query(
             'SELECT subscription_expiry, featured_expiry FROM hotels WHERE id = $1',
             [hotelId]
         );
         
-        const currentExpiry = currentData.rows[0]?.subscription_expiry;
-        const currentFeatured = currentData.rows[0]?.featured_expiry;
+        const currentSubExpiry = currentData.rows[0]?.subscription_expiry;
+        const currentFeatExpiry = currentData.rows[0]?.featured_expiry;
+        
+        const currentSubActive = currentSubExpiry && new Date(currentSubExpiry) > now;
+        const currentFeatActive = currentFeatExpiry && new Date(currentFeatExpiry) > now;
         
         if (amount >= 5000) {
+            // ============================================
+            // FEATURED PAYMENT (5,000 KES)
+            // - Adds 30 days to featured_expiry (stacks with existing featured)
+            // - Ensures subscription_expiry is at least 30 days from now
+            //   (does NOT stack on existing subscription)
+            // ============================================
             isFeatured = true;
             
-            if (currentFeatured && new Date(currentFeatured) > now) {
-                featuredExpiry = new Date(currentFeatured);
+            // 1. Featured: stack 30 days on existing featured (if active) or start fresh
+            if (currentFeatActive) {
+                featuredExpiry = new Date(currentFeatExpiry);
                 featuredExpiry.setDate(featuredExpiry.getDate() + days);
-                message = `🌟 Featured extended by 30 days from ${new Date(currentFeatured).toLocaleDateString()}!`;
+                message = `🌟 Featured extended by 30 days from ${new Date(currentFeatExpiry).toLocaleDateString()}!`;
             } else {
                 featuredExpiry = new Date(now);
                 featuredExpiry.setDate(featuredExpiry.getDate() + days);
                 message = '🌟 Featured activated for 30 days!';
             }
             
-            if (currentExpiry && new Date(currentExpiry) > now) {
-                subscriptionExpiry = new Date(currentExpiry);
-                subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
+            // 2. Subscription: ensure at least 30 days from now.
+            //    - If current subscription is active and has MORE than 30 days, keep it as-is.
+            //    - If current subscription is active but has LESS than 30 days, extend to 30 days.
+            //    - If current subscription is expired/none, set to 30 days from now.
+            const minSubscriptionExpiry = new Date(now);
+            minSubscriptionExpiry.setDate(minSubscriptionExpiry.getDate() + days);
+            
+            if (currentSubActive && new Date(currentSubExpiry) >= minSubscriptionExpiry) {
+                // Subscription already has 30+ days left — keep it unchanged
+                subscriptionExpiry = new Date(currentSubExpiry);
             } else {
-                subscriptionExpiry = new Date(now);
-                subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
+                // Subscription has <30 days left or is expired — set to 30 days from now
+                subscriptionExpiry = minSubscriptionExpiry;
             }
+            
+            message += ' Subscription set to at least 30 days so your hotel stays visible during the featured period.';
+            
         } else {
-            if (currentExpiry && new Date(currentExpiry) > now) {
-                subscriptionExpiry = new Date(currentExpiry);
+            // ============================================
+            // BASIC SUBSCRIPTION PAYMENT (1,000 KES)
+            // - Adds 30 days to subscription_expiry (stacks with existing subscription)
+            // - Featured expiry is NOT touched
+            // ============================================
+            if (currentSubActive) {
+                subscriptionExpiry = new Date(currentSubExpiry);
                 subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
-                message = `📅 Subscription extended by 30 days from ${new Date(currentExpiry).toLocaleDateString()}!`;
+                message = `📅 Subscription extended by 30 days from ${new Date(currentSubExpiry).toLocaleDateString()}!`;
             } else {
                 subscriptionExpiry = new Date(now);
                 subscriptionExpiry.setDate(subscriptionExpiry.getDate() + days);
                 message = '📅 Subscription activated for 30 days!';
             }
+            
+            // Featured expiry remains unchanged (fetch current value to persist)
+            featuredExpiry = currentFeatExpiry ? new Date(currentFeatExpiry) : null;
         }
         
+        // ============================================
+        // PERSIST UPDATES
+        // ============================================
         if (isFeatured) {
             await pool.query(
                 `UPDATE hotels SET 
@@ -1608,7 +1656,7 @@ app.get('/api/hotels/:id/access', async (req, res) => {
 });
 
 // ============================================================
-//  MY BOOKINGS (SORTED - NEW)
+//  MY BOOKINGS (SORTED)
 // ============================================================
 
 app.get('/api/my-bookings', async (req, res) => {
@@ -1623,7 +1671,6 @@ app.get('/api/my-bookings', async (req, res) => {
 
         console.log(`📋 [MY BOOKINGS] Fetching for client: ${clientId}`);
 
-        // Unlocked hotels
         const unlocked = await pool.query(
             `SELECT h.id, h.hotel_name, h.city, h.country, p.expires_at, p.amount
              FROM payments p
@@ -1633,7 +1680,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Room bookings - ALL bookings for this client
         const roomBookings = await pool.query(
             `SELECT rb.*, 
                     COALESCE(r.room_type_name, 'Unknown') as room_type_name, 
@@ -1645,7 +1691,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Food orders - ALL orders for this client
         const foodOrders = await pool.query(
             `SELECT fo.*, COALESCE(h.hotel_name, 'Unknown Hotel') as hotel_name
              FROM food_orders fo
@@ -1654,7 +1699,6 @@ app.get('/api/my-bookings', async (req, res) => {
             [clientId]
         );
 
-        // Apply sort: nearest upcoming → furthest upcoming → past (bottom)
         const sortedRoomBookings = sortBookingsByDate(roomBookings.rows, 'check_in_date');
         const sortedFoodOrders = sortBookingsByDate(foodOrders.rows, 'pickup_date');
 
@@ -1706,7 +1750,7 @@ app.post('/api/food-orders', async (req, res) => {
     }
 });
 
-// WALK-IN FOOD ORDER (with subscription check - NEW)
+// WALK-IN FOOD ORDER (with subscription check)
 app.post('/api/food-orders/walk-in', isHotelOwner, requireActiveSubscription, async (req, res) => {
     try {
         const { hotel_id, items, pickup_date, pickup_time, client_name, client_phone, special_instructions } = req.body;
@@ -1806,7 +1850,6 @@ app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
             [formattedCode, payment_method || 'mpesa', orderId]
         );
         
-        // Store payment code
         const clientName = order.client_name || 'Guest';
         const clientPhone = order.client_phone || '';
         
@@ -1818,7 +1861,7 @@ app.post('/api/food-orders/:id/verify-payment', async (req, res) => {
              formattedCode, order.total_amount, order.booking_reference]
         );
 
-        // Auto-save an online receipt (NEW)
+        // Auto-save an online receipt
         try {
             const items = typeof order.items === 'string' ? JSON.parse(order.items) : order.items;
             const itemNames = (items || []).map(i => `${i.name} x${i.quantity}`).join(', ');
@@ -1919,7 +1962,7 @@ app.post('/api/room-bookings', async (req, res) => {
     }
 });
 
-// WALK-IN ROOM BOOKING (with subscription check - NEW)
+// WALK-IN ROOM BOOKING (with subscription check)
 app.post('/api/room-bookings/walk-in', isHotelOwner, requireActiveSubscription, async (req, res) => {
     try {
         const { hotel_id, room_type_id, check_in_date, check_out_date, number_of_guests, client_name, client_phone, special_requests } = req.body;
@@ -2658,7 +2701,7 @@ app.delete('/api/admin/users/:id', isAdmin, async (req, res) => {
 });
 
 // ============================================================
-//  HOTEL OWNER ROUTES (SORTED - NEW)
+//  HOTEL OWNER ROUTES (SORTED)
 // ============================================================
 
 app.get('/api/hotels/owner/list', isHotelOwner, async (req, res) => {
@@ -2730,7 +2773,6 @@ app.get('/api/hotels/owner/:id', isHotelOwner, async (req, res) => {
             [hotelId]
         );
 
-        // Sort: nearest upcoming → furthest upcoming → past (bottom)
         const sortedRoomBookings = sortBookingsByDate(roomBookingsRaw.rows, 'check_in_date');
         const sortedFoodOrders = sortBookingsByDate(foodOrdersRaw.rows, 'pickup_date');
 
