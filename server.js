@@ -3417,12 +3417,17 @@ app.put('/api/payments/verify-code/:codeId', isHotelOwner, async (req, res) => {
 //  Used when Tuma is disabled and client pays via manual M-Pesa
 // ============================================================
 
-app.post('/api/payments/unlock/verify', async (req, res) => {
-    console.log('\n🚀 [API] Unlock payment MANUAL verify request received');
-    console.log('📥 Request body:', JSON.stringify(req.body, null, 2));
+// ============================================================
+//  UNLOCK PAYMENT - MANUAL VERIFICATION
+//  Client provides the M-Pesa confirmation code from their SMS
+// ============================================================
+
+app.post('/api/payments/unlock/verify-manual', async (req, res) => {
+    console.log('\n🚀 [API] Manual unlock verify request');
+    console.log('📥 Body:', JSON.stringify(req.body, null, 2));
 
     try {
-        const { hotel_id, confirmation_code, reference } = req.body;
+        const { hotel_id, confirmation_code } = req.body;
         const token = req.headers.authorization?.split(' ')[1];
 
         if (!token) {
@@ -3432,20 +3437,19 @@ app.post('/api/payments/unlock/verify', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
 
-        // Validate inputs
         if (!hotel_id) {
             return res.status(400).json({ error: 'Hotel ID is required' });
         }
-        if (!confirmation_code || confirmation_code.length < 4) {
+
+        if (!confirmation_code || confirmation_code.length < 6) {
             return res.status(400).json({ error: 'Please enter a valid M-Pesa confirmation code' });
         }
 
         const code = confirmation_code.toUpperCase().trim();
 
-        // Basic format check (M-Pesa codes are alphanumeric, typically 10 chars)
-        const isValidFormat = /^[A-Z0-9]{4,15}$/i.test(code);
-        if (!isValidFormat) {
-            return res.status(400).json({ error: 'Invalid confirmation code format. Please check your M-Pesa message.' });
+        // Validate format (M-Pesa codes are 10 alphanumeric chars, typically)
+        if (!/^[A-Z0-9]{6,15}$/.test(code)) {
+            return res.status(400).json({ error: 'Invalid confirmation code format' });
         }
 
         // Check if already unlocked
@@ -3464,7 +3468,7 @@ app.post('/api/payments/unlock/verify', async (req, res) => {
             });
         }
 
-        // Verify the hotel exists
+        // Verify hotel exists
         const hotelCheck = await pool.query(
             'SELECT id, hotel_name FROM hotels WHERE id = $1',
             [hotel_id]
@@ -3473,64 +3477,56 @@ app.post('/api/payments/unlock/verify', async (req, res) => {
             return res.status(404).json({ error: 'Hotel not found' });
         }
 
-        // Set unlock expiry (7 days from now, matching UNLOCK_EXPIRY_DAYS)
+        // Check if this confirmation code has already been used for this hotel
+        // (prevents one code unlocking for many clients)
+        const codeUsed = await pool.query(
+            `SELECT * FROM payments 
+             WHERE transaction_id = $1 AND hotel_id = $2`,
+            [code, hotel_id]
+        );
+
+        if (codeUsed.rows.length > 0) {
+            return res.status(400).json({
+                error: 'This M-Pesa confirmation code has already been used to unlock this hotel.'
+            });
+        }
+
+        // Record the payment
         const UNLOCK_EXPIRY_DAYS = 7;
         const expiryDate = new Date(Date.now() + UNLOCK_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
 
-        // Upsert payment record
-        const existingRow = await pool.query(
-            'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2',
-            [clientId, hotel_id]
+        await pool.query(
+            `INSERT INTO payments (client_id, hotel_id, paid, transaction_id, amount, expires_at)
+             VALUES ($1, $2, TRUE, $3, $4, $5)`,
+            [clientId, hotel_id, code, UNLOCK_PRICE, expiryDate]
         );
 
-        if (existingRow.rows.length > 0) {
-            // Update existing
-            await pool.query(
-                `UPDATE payments SET 
-                    paid = TRUE,
-                    expires_at = $1,
-                    transaction_id = $2,
-                    amount = $3,
-                    updated_at = CURRENT_TIMESTAMP
-                 WHERE client_id = $4 AND hotel_id = $5`,
-                [expiryDate, code, UNLOCK_PRICE, clientId, hotel_id]
-            );
-        } else {
-            // Insert new
-            await pool.query(
-                `INSERT INTO payments (client_id, hotel_id, paid, transaction_id, amount, expires_at)
-                 VALUES ($1, $2, TRUE, $3, $4, $5)`,
-                [clientId, hotel_id, code, UNLOCK_PRICE, expiryDate]
-            );
-        }
-
-        // Also log this unlock as a receipt-like record (optional but useful)
+        // Log for reference
         try {
-            const hotel = hotelCheck.rows[0];
             await pool.query(
                 `INSERT INTO pending_payments (client_id, hotel_id, amount, reference, transaction_id, status)
                  VALUES ($1, $2, $3, $4, $5, 'completed')`,
-                [clientId, hotel_id, UNLOCK_PRICE, reference || 'MANUAL-UNLOCK', code]
+                [clientId, hotel_id, UNLOCK_PRICE, 'MANUAL-CODE', code]
             );
         } catch (e) {
             console.warn('⚠️ Could not log to pending_payments:', e.message);
         }
 
-        console.log(`✅ Manual unlock verified: Client ${clientId}, Hotel ${hotel_id}, Code ${code}`);
+        console.log(`✅ [MANUAL] Unlock recorded: Client ${clientId}, Hotel ${hotel_id}, Code ${code}`);
 
         res.json({
             success: true,
-            message: `✅ Payment verified! You now have access to the hotel for ${UNLOCK_EXPIRY_DAYS} days.`,
+            message: `✅ Verified! Hotel unlocked for ${UNLOCK_EXPIRY_DAYS} days.`,
             expires_at: expiryDate
         });
 
     } catch (error) {
         console.error('❌ Manual unlock verify error:', error);
-        res.status(500).json({
-            error: 'Failed to verify payment: ' + error.message
-        });
+        res.status(500).json({ error: 'Failed to verify: ' + error.message });
     }
 });
+
+     
 // Health check endpoint for UptimeRobot
 app.get('/api/health', (req, res) => {
     res.status(200).send('Backend is active');
