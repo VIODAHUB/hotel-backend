@@ -3412,12 +3412,8 @@ app.put('/api/payments/verify-code/:codeId', isHotelOwner, async (req, res) => {
         res.status(500).json({ error: 'Failed to verify payment code' });
     }
 });
-// ============================================================
-//  UNLOCK PAYMENT - MANUAL VERIFICATION (NEW)
-//  Used when Tuma is disabled and client pays via manual M-Pesa
-// ============================================================
 
-// ============================================================
+     // ============================================================
 //  UNLOCK PAYMENT - MANUAL VERIFICATION
 //  Client provides the M-Pesa confirmation code from their SMS
 // ============================================================
@@ -3447,7 +3443,7 @@ app.post('/api/payments/unlock/verify-manual', async (req, res) => {
 
         const code = confirmation_code.toUpperCase().trim();
 
-        // Validate format (M-Pesa codes are 10 alphanumeric chars, typically)
+        // Validate format (M-Pesa codes are 10 alphanumeric chars typically)
         if (!/^[A-Z0-9]{6,15}$/.test(code)) {
             return res.status(400).json({ error: 'Invalid confirmation code format' });
         }
@@ -3478,7 +3474,6 @@ app.post('/api/payments/unlock/verify-manual', async (req, res) => {
         }
 
         // Check if this confirmation code has already been used for this hotel
-        // (prevents one code unlocking for many clients)
         const codeUsed = await pool.query(
             `SELECT * FROM payments 
              WHERE transaction_id = $1 AND hotel_id = $2`,
@@ -3525,8 +3520,6 @@ app.post('/api/payments/unlock/verify-manual', async (req, res) => {
         res.status(500).json({ error: 'Failed to verify: ' + error.message });
     }
 });
-
-     
 // Health check endpoint for UptimeRobot
 app.get('/api/health', (req, res) => {
     res.status(200).send('Backend is active');
