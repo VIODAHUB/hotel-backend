@@ -1345,93 +1345,202 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
 //  PAYMENT CALLBACK WEBHOOK (Tuma)
 // ============================================================
 
+// ============================================================
+//  PAYMENT CALLBACK WEBHOOK (Tuma) - ROBUST VERSION
+// ============================================================
+
 app.post('/api/payment-callback', express.json({ type: 'application/json' }), async (req, res) => {
-    console.log('\n📥 [CALLBACK] Payment callback received!');
-    
+    console.log('\n' + '='.repeat(60));
+    console.log('📥 [CALLBACK] Payment callback received!');
+    console.log('📥 [CALLBACK] Full body:', JSON.stringify(req.body, null, 2));
+    console.log('📥 [CALLBACK] Headers:', JSON.stringify(req.headers, null, 2));
+    console.log('='.repeat(60));
+
+    // Acknowledge IMMEDIATELY to Tuma
+    res.status(200).json({ status: 'received' });
+
     try {
-        const { 
-            transaction_id, 
-            status, 
-            amount, 
-            phone, 
-            account,
-            description 
-        } = req.body;
+        // Tuma may send data in different shapes — normalize
+        const body = req.body || {};
         
-        res.status(200).json({ status: 'received' });
-        console.log('✅ [CALLBACK] Acknowledged callback receipt');
-        
-        if (status === 'completed' || status === 'paid' || status === 'success') {
-            console.log('✅ [CALLBACK] Payment is completed! Processing...');
-            await processSuccessfulUnlockPayment(transaction_id, {
-                amount: amount,
-                phone: phone,
-                reference: account || 'no-account',
-                description: description
-            });
+        // Try common field names
+        const transactionId =
+            body.transaction_id ||
+            body.transactionId ||
+            body.tx_id ||
+            body.id ||
+            body.data?.transaction_id ||
+            body.data?.transactionId ||
+            body.data?.id;
+
+        const status = (
+            body.status ||
+            body.payment_status ||
+            body.data?.status ||
+            ''
+        ).toString().toLowerCase();
+
+        const amount = body.amount || body.data?.amount;
+        const phone = body.phone || body.msisdn || body.data?.phone;
+        const account = body.account || body.account_number || body.data?.account;
+        const description = body.description || body.data?.description;
+        const mpesaCode = body.mpesa_code || body.confirmation_code || body.data?.mpesa_code || 
+                          body.code || body.data?.code;
+
+        console.log('🔍 [CALLBACK] Parsed fields:');
+        console.log('   transaction_id:', transactionId);
+        console.log('   status:', status);
+        console.log('   amount:', amount);
+        console.log('   phone:', phone);
+        console.log('   account:', account);
+        console.log('   description:', description);
+        console.log('   mpesa_code:', mpesaCode);
+
+        // Success indicators
+        const successStates = ['completed', 'paid', 'success', 'successful', 'confirmed', 'ok'];
+        const isSuccess = successStates.includes(status);
+
+        if (!transactionId) {
+            console.warn('⚠️ [CALLBACK] No transaction_id in callback — cannot process');
+            return;
         }
-        
+
+        // Look up the pending payment by transaction_id
+        const pendingResult = await pool.query(
+            `SELECT * FROM pending_payments WHERE transaction_id = $1 ORDER BY created_at DESC LIMIT 1`,
+            [transactionId]
+        );
+
+        if (pendingResult.rows.length === 0) {
+            console.warn(`⚠️ [CALLBACK] No pending_payment found for transaction_id: ${transactionId}`);
+            
+            // Try parsing from description/account as fallback
+            let hotelId = null, clientId = null;
+
+            const descMatch = description?.match(/Unlock hotel (\d+) for client (\d+)/i);
+            if (descMatch) {
+                hotelId = parseInt(descMatch[1]);
+                clientId = parseInt(descMatch[2]);
+            } else {
+                const unlockMatch = (account || description || '')?.match(/UNLOCK-(\d+)-(\d+)/i);
+                if (unlockMatch) {
+                    hotelId = parseInt(unlockMatch[1]);
+                    clientId = parseInt(unlockMatch[2]);
+                }
+            }
+
+            if (hotelId && clientId && isSuccess) {
+                console.log(`✅ [CALLBACK] Fallback matched: Hotel ${hotelId}, Client ${clientId}`);
+                await processSuccessfulUnlockPayment(transactionId, {
+                    amount, phone, reference: account, description, hotelId, clientId, mpesaCode
+                });
+            } else {
+                console.warn('❌ [CALLBACK] Could not identify hotel/client — payment not recorded');
+            }
+            return;
+        }
+
+        const pending = pendingResult.rows[0];
+        console.log(`✅ [CALLBACK] Found pending payment: client=${pending.client_id}, hotel=${pending.hotel_id}, status=${pending.status}`);
+
+        // If already completed, skip
+        if (pending.status === 'completed') {
+            console.log('ℹ️ [CALLBACK] Pending payment already marked completed — nothing to do');
+            return;
+        }
+
+        // Update the pending row status
+        await pool.query(
+            `UPDATE pending_payments SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+            [isSuccess ? 'completed' : 'failed', pending.id]
+        );
+
+        if (isSuccess) {
+            await processSuccessfulUnlockPayment(transactionId, {
+                amount,
+                phone,
+                reference: account,
+                description,
+                hotelId: pending.hotel_id,
+                clientId: pending.client_id,
+                mpesaCode
+            });
+        } else {
+            console.log(`ℹ️ [CALLBACK] Payment status is "${status}" — not marking as paid`);
+        }
+
     } catch (error) {
         console.error('❌ [CALLBACK] Error processing callback:', error);
-        res.status(200).json({ status: 'error', message: error.message });
     }
 });
-
 async function processSuccessfulUnlockPayment(transactionId, data) {
-    const { amount, phone, reference, description } = data;
     console.log(`\n✅ [PROCESS] Processing successful unlock payment: ${transactionId}`);
-    
-    let hotelId, clientId;
-    
-    const descMatch = description?.match(/Unlock hotel (\d+) for client (\d+)/);
-    if (descMatch) {
-        hotelId = parseInt(descMatch[1]);
-        clientId = parseInt(descMatch[2]);
-    } else {
-        const unlockMatch = reference?.match(/UNLOCK-(\d+)-(\d+)/);
-        if (unlockMatch) {
-            hotelId = parseInt(unlockMatch[1]);
-            clientId = parseInt(unlockMatch[2]);
+
+    let { hotelId, clientId, amount, phone, reference, description, mpesaCode } = data;
+
+    // Fallback: parse from description/reference if hotelId/clientId not provided
+    if (!hotelId || !clientId) {
+        const descMatch = description?.match(/Unlock hotel (\d+) for client (\d+)/i);
+        if (descMatch) {
+            hotelId = parseInt(descMatch[1]);
+            clientId = parseInt(descMatch[2]);
+        } else {
+            const unlockMatch = (reference || description || '')?.match(/UNLOCK-(\d+)-(\d+)/i);
+            if (unlockMatch) {
+                hotelId = parseInt(unlockMatch[1]);
+                clientId = parseInt(unlockMatch[2]);
+            }
         }
     }
-    
-    if (hotelId && clientId) {
-        try {
-            const UNLOCK_EXPIRY_DAYS = 7;
-            const expiryDate = new Date(Date.now() + UNLOCK_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
-            
-            const existing = await pool.query(
-                'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2',
-                [clientId, hotelId]
-            );
-            
-            if (existing.rows.length > 0) {
-                await pool.query(
-                    `UPDATE payments SET 
-                        paid = TRUE, 
-                        expires_at = $1,
-                        transaction_id = $2,
-                        updated_at = CURRENT_TIMESTAMP
-                     WHERE client_id = $3 AND hotel_id = $4`,
-                    [expiryDate, transactionId, clientId, hotelId]
-                );
-            } else {
-                await pool.query(
-                    `INSERT INTO payments (client_id, hotel_id, paid, transaction_id, amount, expires_at)
-                     VALUES ($1, $2, TRUE, $3, $4, $5)`,
-                    [clientId, hotelId, transactionId, 100, expiryDate]
-                );
-            }
-            
+
+    if (!hotelId || !clientId) {
+        console.error('❌ [PROCESS] Cannot identify hotel/client — aborting');
+        return;
+    }
+
+    try {
+        const UNLOCK_EXPIRY_DAYS = 7;
+        const expiryDate = new Date(Date.now() + UNLOCK_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+
+        const existing = await pool.query(
+            'SELECT * FROM payments WHERE client_id = $1 AND hotel_id = $2',
+            [clientId, hotelId]
+        );
+
+        const codeToStore = mpesaCode || transactionId;
+
+        if (existing.rows.length > 0) {
             await pool.query(
-                `UPDATE pending_payments SET status = 'completed' WHERE transaction_id = $1`,
-                [transactionId]
+                `UPDATE payments SET 
+                    paid = TRUE,
+                    expires_at = $1,
+                    transaction_id = $2,
+                    amount = COALESCE(amount, $3),
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE client_id = $4 AND hotel_id = $5`,
+                [expiryDate, codeToStore, UNLOCK_PRICE, clientId, hotelId]
             );
-            
-            console.log(`✅ Unlock payment processed: Hotel ${hotelId}, Client ${clientId}`);
-        } catch (error) {
-            console.error('❌ Unlock payment processing error:', error);
+            console.log(`✅ [PROCESS] Updated existing payment: Client ${clientId}, Hotel ${hotelId}`);
+        } else {
+            await pool.query(
+                `INSERT INTO payments (client_id, hotel_id, paid, transaction_id, amount, expires_at)
+                 VALUES ($1, $2, TRUE, $3, $4, $5)`,
+                [clientId, hotelId, codeToStore, UNLOCK_PRICE, expiryDate]
+            );
+            console.log(`✅ [PROCESS] Inserted new payment: Client ${clientId}, Hotel ${hotelId}`);
         }
+
+        // Also update pending_payments (belt and braces)
+        await pool.query(
+            `UPDATE pending_payments SET status = 'completed', updated_at = CURRENT_TIMESTAMP
+             WHERE transaction_id = $1`,
+            [transactionId]
+        );
+
+        console.log(`🎉 [PROCESS] Unlock successful — Client ${clientId} now has access to Hotel ${hotelId} until ${expiryDate.toISOString()}`);
+
+    } catch (error) {
+        console.error('❌ [PROCESS] Unlock payment processing error:', error);
     }
 }
 
@@ -1522,7 +1631,6 @@ app.post('/api/payments/unlock', async (req, res) => {
 // ============================================================
 //  CHECK PAYMENT STATUS
 // ============================================================
-
 app.get('/api/payments/status/:transactionId', async (req, res) => {
     console.log(`\n🔍 [API] Payment status check: ${req.params.transactionId}`);
     
@@ -1537,30 +1645,60 @@ app.get('/api/payments/status/:transactionId', async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
         const clientId = decoded.id;
         
+        // 1. Check local pending_payments first
         const localResult = await pool.query(
-            'SELECT * FROM pending_payments WHERE transaction_id = $1 AND client_id = $2',
+            `SELECT * FROM pending_payments WHERE transaction_id = $1 AND client_id = $2 
+             ORDER BY created_at DESC LIMIT 1`,
             [transactionId, clientId]
         );
         
-        if (localResult.rows.length > 0 && localResult.rows[0].status === 'completed') {
+        if (localResult.rows.length > 0) {
+            const pending = localResult.rows[0];
+            
+            if (pending.status === 'completed') {
+                return res.json({ status: 'completed', paid: true });
+            }
+            
+            // 2. Fallback: ask Tuma directly
+            if (TUMA_CONFIG.ENABLED) {
+                const tumaStatus = await checkTumaPaymentStatus(transactionId);
+                console.log(`📥 [API] Tuma says status: ${tumaStatus.status}`);
+                
+                const successStates = ['completed', 'paid', 'success', 'successful', 'confirmed'];
+                if (successStates.includes((tumaStatus.status || '').toLowerCase())) {
+                    // Tuma confirms — process it ourselves
+                    console.log('✅ [API] Tuma confirms payment — processing locally');
+                    
+                    await pool.query(
+                        `UPDATE pending_payments SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+                        [pending.id]
+                    );
+                    
+                    await processSuccessfulUnlockPayment(transactionId, {
+                        hotelId: pending.hotel_id,
+                        clientId: pending.client_id,
+                        reference: pending.reference
+                    });
+                    
+                    return res.json({ status: 'completed', paid: true });
+                }
+            }
+            
+            return res.json({ status: pending.status || 'pending', paid: false });
+        }
+        
+        // 3. No pending payment found — check payments table directly
+        const paidCheck = await pool.query(
+            `SELECT * FROM payments WHERE client_id = $1 AND paid = TRUE AND transaction_id = $2 
+             AND expires_at > NOW() LIMIT 1`,
+            [clientId, transactionId]
+        );
+        
+        if (paidCheck.rows.length > 0) {
             return res.json({ status: 'completed', paid: true });
         }
         
-        if (!TUMA_CONFIG.ENABLED) {
-            return res.json({ status: 'pending', paid: false });
-        }
-        
-        const status = await checkTumaPaymentStatus(transactionId);
-        
-        if (status.status === 'completed' || status.status === 'paid' || status.status === 'success') {
-            await pool.query(
-                'UPDATE pending_payments SET status = $1 WHERE transaction_id = $2',
-                ['completed', transactionId]
-            );
-            return res.json({ status: 'completed', paid: true });
-        }
-        
-        res.json({ status: status.status || 'pending', paid: false });
+        res.json({ status: 'pending', paid: false });
         
     } catch (error) {
         console.error('❌ Payment status check error:', error);
