@@ -3531,6 +3531,10 @@ app.post('/api/payments/unlock/verify', async (req, res) => {
         });
     }
 });
+// Health check endpoint for UptimeRobot
+app.get('/api/health', (req, res) => {
+    res.status(200).send('Backend is active');
+});
 // ============================================================
 //  START SERVER
 // ============================================================
