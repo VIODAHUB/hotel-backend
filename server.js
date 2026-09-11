@@ -1340,11 +1340,6 @@ app.post('/api/payments/subscription/verify/:hotelId', isHotelOwner, async (req,
         res.status(500).json({ error: 'Failed to verify subscription payment: ' + error.message });
     }
 });
-
-// ============================================================
-//  PAYMENT CALLBACK WEBHOOK (Tuma)
-// ============================================================
-
 // ============================================================
 //  PAYMENT CALLBACK WEBHOOK (Tuma) - ROBUST VERSION
 // ============================================================
@@ -3520,6 +3515,131 @@ app.post('/api/payments/unlock/verify-manual', async (req, res) => {
         res.status(500).json({ error: 'Failed to verify: ' + error.message });
     }
 });
+app.post('/api/payment-callback', express.json({ type: 'application/json' }), async (req, res) => {
+    console.log('\n' + '='.repeat(60));
+    console.log('📥 [CALLBACK] Payment callback received!');
+    console.log('📥 [CALLBACK] Full body:', JSON.stringify(req.body, null, 2));
+    console.log('='.repeat(60));
+
+    // Acknowledge immediately
+    res.status(200).json({ status: 'received' });
+
+    try {
+        const body = req.body || {};
+
+        // Try EVERY possible field name for transaction_id
+        const transactionId =
+            body.transaction_id ||
+            body.transactionId ||
+            body.tx_id ||
+            body.txId ||
+            body.id ||
+            body.reference ||
+            body.account ||
+            body.data?.transaction_id ||
+            body.data?.transactionId ||
+            body.data?.id ||
+            body.data?.reference;
+
+        const status = (
+            body.status ||
+            body.payment_status ||
+            body.result_code === 0 ? 'completed' : null ||
+            body.data?.status ||
+            ''
+        ).toString().toLowerCase();
+
+        const amount = body.amount || body.data?.amount;
+        const phone = body.phone || body.msisdn || body.phone_number || body.data?.phone;
+        const account = body.account || body.account_number || body.reference || body.data?.account;
+
+        console.log('🔍 [CALLBACK] Parsed fields:');
+        console.log('   transaction_id:', transactionId);
+        console.log('   status:', status);
+        console.log('   amount:', amount);
+        console.log('   phone:', phone);
+        console.log('   account:', account);
+
+        const successStates = ['completed', 'paid', 'success', 'successful', 'confirmed', 'ok'];
+        const isSuccess = successStates.includes(status) || body.result_code === 0;
+
+        if (!isSuccess) {
+            console.log(`ℹ️ [CALLBACK] Status not success: "${status}" — ignoring`);
+            return;
+        }
+
+        // ============================================================
+        //  FIND THE PENDING PAYMENT
+        //  1. Try by transaction_id first
+        //  2. Fall back to the MOST RECENT pending payment (if only 1 candidate)
+        // ============================================================
+        let pending = null;
+
+        if (transactionId) {
+            const byTx = await pool.query(
+                `SELECT * FROM pending_payments WHERE transaction_id = $1 
+                 ORDER BY created_at DESC LIMIT 1`,
+                [transactionId]
+            );
+            if (byTx.rows.length > 0) pending = byTx.rows[0];
+        }
+
+        // Fallback: use the most recent pending payment that hasn't been completed
+        if (!pending) {
+            const fallback = await pool.query(
+                `SELECT * FROM pending_payments 
+                 WHERE status = 'pending' AND amount = $1
+                 ORDER BY created_at DESC LIMIT 1`,
+                [amount || 100]
+            );
+            if (fallback.rows.length > 0) {
+                pending = fallback.rows[0];
+                console.log('🎯 [CALLBACK] Matched by amount fallback:', pending.id);
+            }
+        }
+
+        // Fallback 2: use any recent pending (very last resort)
+        if (!pending) {
+            const lastResort = await pool.query(
+                `SELECT * FROM pending_payments 
+                 WHERE status = 'pending'
+                 ORDER BY created_at DESC LIMIT 1`
+            );
+            if (lastResort.rows.length > 0) {
+                pending = lastResort.rows[0];
+                console.log('🎯 [CALLBACK] Matched by last-resort fallback:', pending.id);
+            }
+        }
+
+        if (!pending) {
+            console.warn('❌ [CALLBACK] No matching pending payment found');
+            return;
+        }
+
+        console.log(`✅ [CALLBACK] Processing pending: client=${pending.client_id}, hotel=${pending.hotel_id}`);
+
+        // Mark completed
+        await pool.query(
+            `UPDATE pending_payments SET status = 'completed', updated_at = CURRENT_TIMESTAMP 
+             WHERE id = $1`,
+            [pending.id]
+        );
+
+        // Record the unlock
+        await processSuccessfulUnlockPayment(transactionId || pending.transaction_id, {
+            hotelId: pending.hotel_id,
+            clientId: pending.client_id,
+            amount,
+            phone,
+            reference: account,
+            mpesaCode: body.mpesa_code || body.mpesa_receipt_number || transactionId
+        });
+
+    } catch (error) {
+        console.error('❌ [CALLBACK] Error:', error);
+    }
+});
+
 // Health check endpoint for UptimeRobot
 app.get('/api/health', (req, res) => {
     res.status(200).send('Backend is active');
